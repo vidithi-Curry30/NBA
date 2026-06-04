@@ -50,18 +50,30 @@ def _normalize_historical_event(game_id: str, row: dict) -> dict:
     here means the processor receives the identical schema regardless of source.
     """
     event_type_id = str(row.get("EVENTMSGTYPE", ""))
-    # nba_api event type IDs: 1=made shot, 2=missed, 3=free throw, 4=rebound,
-    # 5=turnover, 6=foul, 8=substitution, 12=period start, 13=end of period
-    event_type_map = {
-        "1": "score",
-        "2": "missed shot",
-        "3": "score",   # free throw made
-        "5": "turnover",
-        "8": "substitution",
-        "12": "period start",
-        "13": "end of game",
-    }
-    event_type = event_type_map.get(event_type_id, "other")
+    # nba_api event type IDs: 1=made shot, 2=missed shot, 3=free throw,
+    # 4=rebound, 5=turnover, 6=foul, 8=substitution, 12=period start, 13=end.
+    desc = str(row.get("HOMEDESCRIPTION") or row.get("VISITORDESCRIPTION") or "")
+
+    if event_type_id == "1":
+        event_type = "score"
+    elif event_type_id == "3":
+        # WHY check description for "MISS": EVENTMSGTYPE 3 covers both made and
+        # missed free throws. nba_api marks misses with "MISS" at the start of
+        # the description string. Mapping all type-3 events to "score" would
+        # inflate home/away scores by recording possessions for missed free throws.
+        event_type = "missed shot" if desc.upper().startswith("MISS") else "score"
+    elif event_type_id == "2":
+        event_type = "missed shot"
+    elif event_type_id == "5":
+        event_type = "turnover"
+    elif event_type_id == "8":
+        event_type = "substitution"
+    elif event_type_id == "12":
+        event_type = "period start"
+    elif event_type_id == "13":
+        event_type = "end of game"
+    else:
+        event_type = "other"
 
     raw_clock = str(row.get("PCTIMESTRING", "12:00"))
     home_score_str = str(row.get("SCORE", "") or "")
@@ -138,6 +150,10 @@ async def _run_replay(game_id: str, speed: float) -> None:
 
                 if prev_clock_seconds is not None and prev_period == period:
                     delta = (prev_clock_seconds - clock_seconds) / speed
+                    # WHY delta > 0 guard: at period boundaries the clock resets
+                    # from 0:00 to 12:00, making delta negative. Skipping the
+                    # sleep here is correct — the period break isn't game time
+                    # and shouldn't be modeled as a real-time pause.
                     if delta > 0:
                         await asyncio.sleep(delta)
 

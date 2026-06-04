@@ -1,21 +1,26 @@
 """
 FastAPI REST API: serves current game state from Redis Hash.
 
-All reads are O(1) lookups against a materialized Redis Hash maintained by
-the processor. The API never touches the Redis Stream — that's the CQRS
-pattern: stream is the write path, hash is the read path.
+All reads except /events are O(1) lookups against a materialized Redis Hash
+maintained by the processor. /events intentionally reads from the stream and
+is documented as O(n) — this is the one place CQRS inverts: sometimes you
+want the audit log, not just current state.
 """
 
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+from src.metrics import (
+    LEAGUE_AVERAGE_OFFENSIVE_RATING,
+    LEAGUE_AVERAGE_PACE,
+    compute_efficiency,
+)
 from src.state import GameState
 
 load_dotenv()
@@ -25,11 +30,7 @@ logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 STATE_KEY_TEMPLATE = "game_state:{game_id}"
-
-# WHY league average 100.0: NBA league average pace has been ~98-102 possessions
-# per 48 minutes over the past five seasons. 100 is a clean round number that
-# serves as an intuitive baseline for pace_differential interpretation.
-LEAGUE_AVERAGE_PACE = 100.0
+STREAM_KEY_TEMPLATE = "game_events:{game_id}"
 
 redis_client: aioredis.Redis | None = None
 
@@ -70,11 +71,10 @@ async def _get_state_from_redis(game_id: str) -> GameState:
     """
     Read and deserialize GameState from the Redis Hash materialized view.
 
-    WHY read from Redis Hash and not from the stream: the stream is
-    append-only and sequential — querying it for current state requires
-    replaying all events (O(n)). The processor maintains a materialized
-    snapshot in the hash so reads are always O(1) regardless of game length.
-    This is the read side of the CQRS pattern.
+    WHY read from Redis Hash and not from the stream: the stream is append-only
+    and sequential — querying it for current state requires replaying all events
+    (O(n)). The processor maintains a materialized snapshot in the hash so reads
+    are always O(1) regardless of game length. This is the read side of CQRS.
     """
     if redis_client is None:
         raise HTTPException(status_code=503, detail="Redis not available")
@@ -91,39 +91,61 @@ async def _get_state_from_redis(game_id: str) -> GameState:
     return GameState.model_validate_json(raw)
 
 
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
 class MomentumResponse(BaseModel):
-    """Response schema for the /momentum endpoint."""
     game_id: str
     last_10_possessions: list[str]
-    # WHY momentum_score = home_scoring_count - away_scoring_count:
-    # positive means home team on a run, negative means away. Near zero
-    # means contested. 10 possessions is long enough to be meaningful
-    # (not noise) but short enough to reflect the current game state
-    # rather than first-half history.
     momentum_score: int
     interpretation: str
 
 
 class PaceResponse(BaseModel):
-    """Response schema for the /pace endpoint."""
     game_id: str
     pace: float
     league_average: float
-    # WHY pace_differential: raw pace is hard to interpret without a baseline.
-    # Differential against 100 tells you immediately whether this game is
-    # faster or slower than average — the same intuition as +/- in trading.
     pace_differential: float
     interpretation: str
 
 
+class EfficiencyResponse(BaseModel):
+    game_id: str
+    home_team: str
+    away_team: str
+    home_offensive_rating: float
+    away_offensive_rating: float
+    # Differential vs. 2023-24 league average (~113 pts/100 possessions).
+    home_ortg_vs_average: float
+    away_ortg_vs_average: float
+    interpretation: str
+
+
+class StreamEvent(BaseModel):
+    """One entry from the Redis Stream — the raw event as pushed by the poller."""
+    stream_id: str
+    fields: dict
+
+
+class EventsResponse(BaseModel):
+    game_id: str
+    count: int
+    events: list[StreamEvent]
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/game/{game_id}/state", response_model=GameState)
 async def get_game_state(game_id: str) -> GameState:
     """
-    Return the full current GameState for a game.
+    Return the full current GameState.
 
-    WHY return the full state rather than individual fields: callers can
-    cache the full object client-side and derive any metric locally;
-    field-level endpoints would require multiple round-trips for dashboards.
+    WHY return the full state: callers can cache the full object client-side
+    and derive any metric locally; field-level endpoints would require multiple
+    round-trips for dashboard use cases.
     """
     return await _get_state_from_redis(game_id)
 
@@ -133,10 +155,16 @@ async def get_momentum(game_id: str) -> MomentumResponse:
     """
     Return momentum signal derived from the last 10 possessions.
 
-    WHY 10 possessions: roughly 3-4 minutes of game time — captures a
-    meaningful run without averaging out the current stretch over the
-    entire game. In basketball analytics this window size is a common
-    convention for "recent form" metrics.
+    WHY 10 possessions: roughly 3-4 minutes of game time — captures a run
+    without averaging it over the entire game. Fewer than 5 is noisy;
+    more than 15 blends current form with history. 10 is the informal
+    NBA-analytics convention for "recent form" window size.
+
+    WHY threshold |momentum_score| > 2 for "on a run": in a balanced game
+    you expect roughly equal home/away scoring in any 10-possession window.
+    A difference of ±2 out of 10 is within normal variance; ±3 (30% skew)
+    is a statistically meaningful shift in possession outcomes. This is a
+    practical heuristic, not a hypothesis test — adjust as needed.
     """
     state = await _get_state_from_redis(game_id)
 
@@ -166,10 +194,10 @@ async def get_pace(game_id: str) -> PaceResponse:
 
     WHY pace matters: it contextualizes the score. A 120-110 game at pace 115
     is a fast-break blowout; the same score at pace 85 is a grinding defensive
-    battle. Pace is one of the four factors in NBA efficiency analysis.
+    battle. Pace is one of the four factors in NBA efficiency analysis
+    (Oliver, "Basketball on Paper", 2004).
     """
     state = await _get_state_from_redis(game_id)
-
     pace_differential = round(state.pace - LEAGUE_AVERAGE_PACE, 2)
 
     if pace_differential > 5:
@@ -186,6 +214,74 @@ async def get_pace(game_id: str) -> PaceResponse:
         pace_differential=pace_differential,
         interpretation=interpretation,
     )
+
+
+@app.get("/game/{game_id}/efficiency", response_model=EfficiencyResponse)
+async def get_efficiency(game_id: str) -> EfficiencyResponse:
+    """
+    Return offensive rating for both teams vs. the league average.
+
+    WHY offensive rating over raw score: points per 100 possessions normalizes
+    for pace — a team scoring 110 in 90 possessions is more efficient than one
+    scoring 120 in 120 possessions. Offensive rating is how NBA front offices
+    actually evaluate teams. A positive ortg_vs_average means the offense is
+    performing above the league average of ~113 pts/100 possessions.
+    """
+    state = await _get_state_from_redis(game_id)
+    snap = compute_efficiency(state)
+
+    if snap.home_offensive_rating > snap.away_offensive_rating + 10:
+        interpretation = f"{state.home_team} offense dominant"
+    elif snap.away_offensive_rating > snap.home_offensive_rating + 10:
+        interpretation = f"{state.away_team} offense dominant"
+    else:
+        interpretation = "Offenses evenly matched"
+
+    return EfficiencyResponse(
+        game_id=game_id,
+        home_team=state.home_team,
+        away_team=state.away_team,
+        home_offensive_rating=snap.home_offensive_rating,
+        away_offensive_rating=snap.away_offensive_rating,
+        home_ortg_vs_average=snap.home_ortg_vs_average,
+        away_ortg_vs_average=snap.away_ortg_vs_average,
+        interpretation=interpretation,
+    )
+
+
+@app.get("/game/{game_id}/events", response_model=EventsResponse)
+async def get_events(
+    game_id: str,
+    limit: int = Query(default=50, ge=1, le=500),
+) -> EventsResponse:
+    """
+    Return raw events from the Redis Stream — the append-only event log.
+
+    WHY this endpoint is O(n) while all others are O(1): this is the one
+    deliberate exception to the CQRS rule. Sometimes you need the audit log —
+    to debug unexpected state, replay a sequence, or inspect exactly what the
+    poller pushed. The O(n) cost is acceptable for a debugging/inspection
+    endpoint that isn't on the hot query path. The limit parameter bounds worst-
+    case latency. Callers who want current state should use /state instead.
+    """
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis not available")
+
+    stream_key = STREAM_KEY_TEMPLATE.format(game_id=game_id)
+    # WHY XREVRANGE with COUNT: we want the most recent `limit` events,
+    # not the oldest. XREVRANGE reads newest-first so we get recency without
+    # scanning the full stream from the beginning.
+    raw_entries = await redis_client.xrevrange(stream_key, count=limit)
+
+    if not raw_entries:
+        raise HTTPException(status_code=404, detail="Game not found or not yet started")
+
+    events = [
+        StreamEvent(stream_id=msg_id, fields=fields)
+        for msg_id, fields in raw_entries
+    ]
+
+    return EventsResponse(game_id=game_id, count=len(events), events=events)
 
 
 @app.get("/health")

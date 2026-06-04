@@ -12,8 +12,7 @@ from src.state import GameState
 
 def make_base_state(game_id: str = "0042300401") -> GameState:
     """Return a fresh GameState with team names pre-set for test convenience."""
-    state = GameState(game_id=game_id, home_team="BOS", away_team="DAL")
-    return state
+    return GameState(game_id=game_id, home_team="BOS", away_team="DAL")
 
 
 # ---------------------------------------------------------------------------
@@ -52,13 +51,13 @@ def test_away_score_update():
 
 def test_score_unchanged_event_does_not_record_possession():
     """
-    An event that carries the current score without changing it should not
+    An event carrying the current score without changing it should not
     create a duplicate possession entry.
     """
     state = make_base_state()
     state.home_score = 5
     state.away_score = 3
-    initial_possessions = len(state.last_10_possessions)
+    initial_home = state.home_possessions
     state.update({
         "event_type": "score",
         "home_score": "5",
@@ -66,39 +65,56 @@ def test_score_unchanged_event_does_not_record_possession():
         "period": "1",
         "clock": "9:00",
     })
-    assert len(state.last_10_possessions) == initial_possessions
+    assert state.home_possessions == initial_home
 
 
 # ---------------------------------------------------------------------------
-# Possession count tests
+# Possession count tests — now per-team
 # ---------------------------------------------------------------------------
 
-def test_possession_count_increments_on_score():
-    """Each scoring play increments possession_count by exactly 1."""
-    state = make_base_state()
-    assert state.possession_count == 0
-    state.update({"event_type": "score", "home_score": "2", "away_score": "0",
-                  "period": "1", "clock": "11:00"})
-    assert state.possession_count == 1
-
-
-def test_possession_count_increments_on_turnover():
-    """Turnovers count as possessions for pace even though no points score."""
-    state = make_base_state()
-    state.update({"event_type": "turnover", "period": "1", "clock": "10:00"})
-    assert state.possession_count == 1
-    assert state.last_10_possessions[-1] == "turnover"
-
-
-def test_possession_count_increments_multiple():
-    """Cumulative possession count across mixed event types."""
+def test_home_possession_increments_on_home_score():
+    """Home scoring play increments home_possessions, not away_possessions."""
     state = make_base_state()
     state.update({"event_type": "score", "home_score": "2", "away_score": "0",
                   "period": "1", "clock": "11:00"})
-    state.update({"event_type": "turnover", "period": "1", "clock": "10:30"})
+    assert state.home_possessions == 1
+    assert state.away_possessions == 0
+
+
+def test_away_possession_increments_on_away_score():
+    """Away scoring play increments away_possessions, not home_possessions."""
+    state = make_base_state()
+    state.home_score = 2
     state.update({"event_type": "score", "home_score": "2", "away_score": "3",
-                  "period": "1", "clock": "10:00"})
-    assert state.possession_count == 3
+                  "period": "1", "clock": "10:30"})
+    assert state.away_possessions == 1
+    assert state.home_possessions == 0
+
+
+def test_possession_count_property_is_sum():
+    """possession_count property equals home + away possessions."""
+    state = make_base_state()
+    state.update({"event_type": "score", "home_score": "2", "away_score": "0",
+                  "period": "1", "clock": "11:00"})
+    state.home_score = 2
+    state.update({"event_type": "score", "home_score": "2", "away_score": "3",
+                  "period": "1", "clock": "10:30"})
+    assert state.possession_count == 2
+    assert state.possession_count == state.home_possessions + state.away_possessions
+
+
+def test_turnover_increments_correct_team_possession():
+    """Turnover by DAL (away) increments away_possessions."""
+    state = make_base_state()
+    state.update({
+        "event_type": "turnover",
+        "team": "DAL",
+        "period": "1",
+        "clock": "10:00",
+    })
+    assert state.away_possessions == 1
+    assert state.home_possessions == 0
+    assert state.last_10_possessions[-1] == "turnover"
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +125,12 @@ def test_last_10_possessions_max_length():
     """last_10_possessions never exceeds 10 entries regardless of events."""
     state = make_base_state()
     current_home = 0
-    current_away = 0
-    for i in range(15):
+    for _ in range(15):
         current_home += 2
         state.update({
             "event_type": "score",
             "home_score": str(current_home),
-            "away_score": str(current_away),
+            "away_score": "0",
             "period": "1",
             "clock": "11:00",
         })
@@ -127,7 +142,8 @@ def test_last_10_possessions_correct_outcomes():
     state = make_base_state()
     state.update({"event_type": "score", "home_score": "2", "away_score": "0",
                   "period": "1", "clock": "11:00"})
-    state.update({"event_type": "turnover", "period": "1", "clock": "10:30"})
+    state.update({"event_type": "turnover", "team": "DAL", "period": "1", "clock": "10:30"})
+    state.home_score = 2
     state.update({"event_type": "score", "home_score": "2", "away_score": "3",
                   "period": "1", "clock": "10:00"})
     assert state.last_10_possessions == ["home_score", "turnover", "away_score"]
@@ -137,14 +153,12 @@ def test_last_10_possessions_rolling_window():
     """Oldest entries are dropped when the list exceeds 10."""
     state = make_base_state()
     current_home = 0
-    current_away = 0
-    # Push 11 home scores
-    for i in range(11):
+    for _ in range(11):
         current_home += 2
         state.update({
             "event_type": "score",
             "home_score": str(current_home),
-            "away_score": str(current_away),
+            "away_score": "0",
             "period": "1",
             "clock": "11:00",
         })
@@ -158,14 +172,32 @@ def test_last_10_possessions_rolling_window():
 
 def test_pace_formula():
     """
-    Given known possession_count and minutes_elapsed, pace = (count/min)*48.
-    At 10 possessions in 5 minutes: pace = (10/5)*48 = 96.0
+    Given known per-team possessions and minutes_elapsed, verify pace formula.
+
+    Formula: ((home + away) / 2 / minutes_elapsed) * 48
+    At 10 home + 10 away possessions in 10 minutes: pace = (10/10)*48 = 48.
+    WHY /2: NBA pace is per-team per 48 min, not combined possessions.
     """
     state = make_base_state()
-    state.possession_count = 10
-    state.minutes_elapsed = 5.0
+    state.home_possessions = 10
+    state.away_possessions = 10
+    state.minutes_elapsed = 10.0
     state._update_pace()
-    assert abs(state.pace - 96.0) < 0.01
+    assert abs(state.pace - 48.0) < 0.01
+
+
+def test_pace_per_team_not_combined():
+    """
+    If home has 20 possessions and away has 0, pace should reflect 10 per team
+    average — not 20 combined. This verifies the /2 in the formula.
+    """
+    state = make_base_state()
+    state.home_possessions = 20
+    state.away_possessions = 0
+    state.minutes_elapsed = 10.0
+    state._update_pace()
+    # (20 + 0) / 2 / 10 * 48 = 48.0
+    assert abs(state.pace - 48.0) < 0.01
 
 
 def test_pace_zero_at_game_start():
@@ -175,16 +207,15 @@ def test_pace_zero_at_game_start():
 
 
 def test_pace_updates_after_event():
-    """Pace is recalculated after each event that advances the game clock."""
+    """Pace is recalculated and non-zero after a scoring event."""
     state = make_base_state()
     state.update({
         "event_type": "score",
         "home_score": "2",
         "away_score": "0",
         "period": "1",
-        "clock": "11:00",   # 1 minute elapsed in period 1
+        "clock": "11:00",
     })
-    # 1 possession in 1 minute → pace = (1/1)*48 = 48
     assert state.pace > 0
 
 
@@ -193,14 +224,14 @@ def test_pace_updates_after_event():
 # ---------------------------------------------------------------------------
 
 def test_period_change_updates_period():
-    """Period counter increments on a 'period start' event."""
+    """Period counter updates on a 'period start' event."""
     state = make_base_state()
     state.update({"event_type": "period start", "period": "2", "clock": "12:00"})
     assert state.period == 2
 
 
 def test_period_change_resets_clock():
-    """Clock resets to 12:00 (or 5:00 for OT) on a period start event."""
+    """Clock resets to 12:00 on a regulation period start."""
     state = make_base_state()
     state.update({"event_type": "period start", "period": "2", "clock": "12:00"})
     assert state.clock == "12:00"
@@ -215,11 +246,46 @@ def test_ot_period_clock_resets_to_five_minutes():
 
 
 # ---------------------------------------------------------------------------
-# Substitution tests
+# Substitution tests — live API pattern (sub_type = in/out)
 # ---------------------------------------------------------------------------
 
-def test_substitution_swaps_home_player():
-    """A home-team substitution removes the outgoing player and adds the incoming."""
+def test_substitution_in_adds_player():
+    """A sub_type='in' event appends the player to the correct team roster."""
+    state = make_base_state()
+    state.home_players_on_court = ["p1", "p2", "p3", "p4", "p5"]
+    state.update({
+        "event_type": "substitution",
+        "team": "BOS",
+        "sub_type": "in",
+        "player": "p6",
+        "period": "1",
+        "clock": "8:00",
+    })
+    assert "p6" in state.home_players_on_court
+
+
+def test_substitution_out_removes_player():
+    """A sub_type='out' event removes the player from the correct team roster."""
+    state = make_base_state()
+    state.home_players_on_court = ["p1", "p2", "p3", "p4", "p5"]
+    state.update({
+        "event_type": "substitution",
+        "team": "BOS",
+        "sub_type": "out",
+        "player": "p3",
+        "period": "1",
+        "clock": "8:00",
+    })
+    assert "p3" not in state.home_players_on_court
+    assert len(state.home_players_on_court) == 4
+
+
+# ---------------------------------------------------------------------------
+# Substitution tests — historical API pattern (player_in / player_out)
+# ---------------------------------------------------------------------------
+
+def test_substitution_historical_swaps_home_player():
+    """Historical combined substitution event swaps the correct players."""
     state = make_base_state()
     state.home_players_on_court = ["p1", "p2", "p3", "p4", "p5"]
     state.update({
@@ -234,8 +300,8 @@ def test_substitution_swaps_home_player():
     assert "p6" in state.home_players_on_court
 
 
-def test_substitution_swaps_away_player():
-    """An away-team substitution updates the away roster, not the home roster."""
+def test_substitution_historical_swaps_away_player():
+    """Away-team historical substitution updates away roster only."""
     state = make_base_state()
     state.away_players_on_court = ["a1", "a2", "a3", "a4", "a5"]
     state.update({
@@ -248,12 +314,11 @@ def test_substitution_swaps_away_player():
     })
     assert "a2" not in state.away_players_on_court
     assert "a6" in state.away_players_on_court
-    # Home roster must be untouched
     assert state.home_players_on_court == []
 
 
-def test_substitution_unknown_team_is_ignored():
-    """A substitution event with an unrecognized team abbreviation is a no-op."""
+def test_substitution_unknown_team_is_noop():
+    """A substitution with an unrecognized team abbreviation is a no-op."""
     state = make_base_state()
     state.home_players_on_court = ["p1", "p2", "p3", "p4", "p5"]
     state.update({
