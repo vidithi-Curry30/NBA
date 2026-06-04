@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r nba-game-processor/requirements.txt
+
+      # WHY no Redis service container: all tests mock Redis at the client
+      # level. Running a real Redis in CI would make tests slower and introduce
+      # flakiness from network timing — mocking is strictly better for unit tests.
+      - name: Run tests
+        run: pytest nba-game-processor/tests/ -v --tb=short
+        env:
+          REDIS_URL: redis://localhost:6379
+          NBA_API_DELAY: "3"
