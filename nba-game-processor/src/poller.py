@@ -64,6 +64,13 @@ def _build_event(game_id: str, play: dict, home_team: str, away_team: str) -> di
     else:
         event_type = action_type
 
+    # WHY sub_type propagation: the live API emits substitutions as two separate
+    # events — one with subType="out" (player leaving) and one with subType="in"
+    # (player entering). State.py's _handle_substitution detects this pattern and
+    # updates the roster correctly. Without sub_type, we can't tell which direction
+    # the substitution goes from a single event.
+    sub_type = str(play.get("subType", "")).lower() if action_type == "substitution" else ""
+
     return {
         "game_id": game_id,
         "event_type": event_type,
@@ -73,8 +80,7 @@ def _build_event(game_id: str, play: dict, home_team: str, away_team: str) -> di
         "period": str(play.get("period", "")),
         "clock": str(play.get("clock", "").replace("PT", "").replace("M", ":").rstrip("S")),
         "player": str(play.get("playerNameI", "")),
-        "player_in": str(play.get("playerNameI", "")),
-        "player_out": str(play.get("playerNameI", "")),
+        "sub_type": sub_type,
         "team": str(play.get("teamTricode", "")),
         "home_team": home_team,
         "away_team": away_team,
