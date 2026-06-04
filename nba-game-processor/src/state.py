@@ -7,8 +7,7 @@ and how raw play-by-play events mutate it. Keeping state transitions here
 """
 
 from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GameState(BaseModel):
@@ -19,6 +18,12 @@ class GameState(BaseModel):
     field validation, and a clear schema contract between the processor and API.
     Every field is typed so bugs surface at model construction, not at query time.
     """
+
+    # WHY model_config frozen=False: Pydantic v2 models are immutable by default.
+    # We explicitly opt into mutability here because GameState is updated in-place
+    # by the processor on every event — creating a new instance per event would
+    # add unnecessary allocation overhead and complicate the processor loop.
+    model_config = ConfigDict(frozen=False)
 
     # WHY game_id as string: nba_api returns game IDs like "0022300512" — leading
     # zeros would be lost if stored as int, breaking all downstream lookups.
@@ -36,23 +41,23 @@ class GameState(BaseModel):
 
     clock: str = "12:00"  # time remaining in period, e.g. "4:32"
 
-    # WHY track possession_count separately from scoring plays: pace requires
-    # total possessions including non-scoring ones (turnovers, defensive stops).
-    possession_count: int = 0
-
-    # WHY player lists as str IDs not names: nba_api substitution events give
-    # player IDs; resolving names on every event would require extra API calls.
-    home_players_on_court: list[str] = Field(default_factory=list)
-    away_players_on_court: list[str] = Field(default_factory=list)
+    # WHY track home and away possessions separately rather than a single total:
+    # NBA pace is defined per team (possessions per 48 min per team), not combined.
+    # A team that runs 60 possessions while holding the opponent to 40 should
+    # not have the same pace as one that played 50 possessions on each side.
+    # Tracking separately also enables per-team offensive rating calculations.
+    home_possessions: int = 0
+    away_possessions: int = 0
 
     # WHY cap at 10: long enough for a meaningful momentum signal (3+ possessions
     # is noise; 10 is a mini-quarter's worth), short enough to reflect current
     # game state rather than first-half history.
     last_10_possessions: list[str] = Field(default_factory=list)
 
-    # WHY pace as float: possessions per 48 minutes. League average is ~100.
-    # Pace contextualizes score — a 120-110 game at pace 115 is a blowout;
-    # at pace 85 it's a close game with very different defensive implications.
+    # WHY pace as float: possessions per 48 minutes per team. League average is
+    # ~100. Pace contextualizes score — a 120-110 game at pace 115 is a blowout;
+    # at pace 85 it's a grinding defensive battle. Pace is one of the four factors
+    # in NBA efficiency analysis (Dean Oliver, "Basketball on Paper", 2004).
     pace: float = 0.0
 
     # WHY store minutes_elapsed separately: pace formula divides by time elapsed,
@@ -62,7 +67,23 @@ class GameState(BaseModel):
     # WHY store game_status: processor uses this to stop consuming once "Final".
     game_status: str = "in_progress"
 
+    # WHY player lists as str IDs not names: nba_api substitution events give
+    # player names; we store exactly what the event provides. Name-based lookup
+    # is sufficient for roster tracking — player ID resolution is a separate
+    # concern for a future player-stats endpoint.
+    home_players_on_court: list[str] = Field(default_factory=list)
+    away_players_on_court: list[str] = Field(default_factory=list)
+
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # -------------------------------------------------------------------------
+    # Derived property helpers — not stored, computed on demand by the API
+    # -------------------------------------------------------------------------
+
+    @property
+    def possession_count(self) -> int:
+        """Total possessions across both teams — used for backward compatibility."""
+        return self.home_possessions + self.away_possessions
 
     def _parse_clock(self, clock_str: str, period: int) -> float:
         """
@@ -81,8 +102,7 @@ class GameState(BaseModel):
         # WHY 12 per regulation period, 5 per OT period:
         # standard NBA period lengths; OT is 5 minutes.
         if period <= 4:
-            minutes_per_period = 12.0
-            elapsed_in_period = minutes_per_period - minutes_left - (seconds_left / 60.0)
+            elapsed_in_period = 12.0 - minutes_left - (seconds_left / 60.0)
             return (period - 1) * 12.0 + elapsed_in_period
         else:
             ot_number = period - 4
@@ -93,23 +113,32 @@ class GameState(BaseModel):
         """
         Recalculate pace after each possession event.
 
-        WHY formula (possession_count / minutes_elapsed) * 48: this annualizes
-        the current possession rate to a full-game (48 min) basis so it's
-        comparable to the league-average stat of ~100 possessions per 48 min.
+        WHY formula ((home + away) / 2 / minutes_elapsed) * 48: NBA pace is
+        defined as possessions per team per 48 minutes. Dividing the combined
+        count by 2 gives the per-team average, which is comparable to the
+        league-average stat of ~100 possessions per team per game.
+        Ref: Basketball Reference pace formula.
         """
         if self.minutes_elapsed > 0:
-            self.pace = (self.possession_count / self.minutes_elapsed) * 48.0
+            avg_team_possessions = (self.home_possessions + self.away_possessions) / 2.0
+            self.pace = (avg_team_possessions / self.minutes_elapsed) * 48.0
 
-    def _record_possession(self, outcome: str) -> None:
+    def _record_possession(self, team: str, outcome: str) -> None:
         """
-        Append outcome to last_10_possessions, enforcing the 10-entry cap.
+        Increment the correct team's possession counter and append to the window.
 
-        WHY enforce max 10 here rather than in the API: keeping the list bounded
-        in the model means the Redis Hash payload stays small regardless of game
-        length, and the momentum endpoint never needs to slice.
+        WHY track which team had the possession: offensive rating is points per
+        100 *that team's* possessions — a number only meaningful if you know
+        which team controlled the ball, not just that a scoring play occurred.
         """
-        self.possession_count += 1
+        if team == "home":
+            self.home_possessions += 1
+        elif team == "away":
+            self.away_possessions += 1
+
         self.last_10_possessions.append(outcome)
+        # WHY pop from front not back: the list is ordered oldest-first;
+        # we want the 10 *most recent* entries, so we drop the oldest.
         if len(self.last_10_possessions) > 10:
             self.last_10_possessions.pop(0)
 
@@ -117,48 +146,42 @@ class GameState(BaseModel):
         """
         Update score and record possession outcome on a scoring play.
 
-        WHY: scoring plays are the most common event type and must update both
-        the displayed score and the possession history used for momentum.
+        WHY check delta > 0 before recording: nba_api sometimes carries the
+        current running score on non-scoring events (e.g., fouls). We only
+        record a possession when the score actually changes, preventing
+        duplicate possession entries that would corrupt the pace calculation.
         """
         home_score = event.get("home_score")
         away_score = event.get("away_score")
 
-        if home_score is not None:
-            try:
-                new_home = int(home_score)
-                new_away = int(away_score) if away_score is not None else self.away_score
+        if home_score is None:
+            return
+        try:
+            new_home = int(home_score)
+            new_away = int(away_score) if away_score is not None else self.away_score
+        except (ValueError, TypeError):
+            return
 
-                if new_home > self.home_score:
-                    # WHY check delta > 0: nba_api sometimes resends the same score
-                    # for non-scoring events; only record a possession when score
-                    # actually changes.
-                    self.home_score = new_home
-                    self.away_score = new_away
-                    self._record_possession("home_score")
-                elif new_away > self.away_score:
-                    self.home_score = new_home
-                    self.away_score = new_away
-                    self._record_possession("away_score")
-            except (ValueError, TypeError):
-                pass
+        if new_home > self.home_score:
+            self.home_score = new_home
+            self.away_score = new_away
+            self._record_possession("home", "home_score")
+        elif new_away > self.away_score:
+            self.home_score = new_home
+            self.away_score = new_away
+            self._record_possession("away", "away_score")
 
     def _handle_substitution(self, event: dict) -> None:
         """
-        Swap one player for another in the on-court roster.
+        Update the on-court roster for one substitution action.
 
-        WHY: tracking on-court players enables lineup-based analytics downstream
-        (e.g., net rating by lineup). We store player IDs, not names, to avoid
-        a secondary lookup on every substitution event.
+        WHY handle two event patterns: the live API (poller.py) emits one event
+        per player with sub_type="in" or "out". The historical API (replay.py)
+        emits one combined event with player_in and player_out both populated.
+        Supporting both lets replay feed through the identical pipeline without
+        schema conversion.
         """
         team = event.get("team", "")
-        player_in = str(event.get("player_in", ""))
-        player_out = str(event.get("player_out", ""))
-
-        if not player_in or not player_out:
-            return
-
-        # WHY determine home vs away by team abbreviation stored at game start:
-        # nba_api substitution events include the team tricode on every event.
         if team == self.home_team:
             roster = self.home_players_on_court
         elif team == self.away_team:
@@ -166,9 +189,25 @@ class GameState(BaseModel):
         else:
             return
 
-        if player_out in roster:
-            roster.remove(player_out)
-        roster.append(player_in)
+        sub_type = str(event.get("sub_type", "")).lower()
+        player = str(event.get("player", ""))
+        player_in = str(event.get("player_in", ""))
+        player_out = str(event.get("player_out", ""))
+
+        if sub_type == "in" and player:
+            # Live API pattern: single-player "in" event.
+            roster.append(player)
+        elif sub_type == "out" and player:
+            # Live API pattern: single-player "out" event.
+            if player in roster:
+                roster.remove(player)
+        elif player_in and player_out and player_in != player_out:
+            # Historical API pattern: combined event with both players named.
+            # WHY check player_in != player_out: nba_api historical data
+            # occasionally has malformed rows where both fields are the same name.
+            if player_out in roster:
+                roster.remove(player_out)
+            roster.append(player_in)
 
     def _handle_period_change(self, event: dict) -> None:
         """
@@ -184,8 +223,6 @@ class GameState(BaseModel):
                 self.period = int(new_period)
             except (ValueError, TypeError):
                 pass
-        # WHY reset clock to standard period length: this is the canonical
-        # starting state for the new period; individual events will update it.
         self.clock = "5:00" if self.period > 4 else "12:00"
 
     def _handle_turnover(self, event: dict) -> None:
@@ -194,9 +231,12 @@ class GameState(BaseModel):
 
         WHY: turnovers count as possessions for pace calculation even though
         no points are scored. Omitting them would overestimate pace in
-        turnover-heavy games.
+        turnover-heavy games (a team that turns it over 20 times looks faster
+        than it is if you only count scoring possessions).
         """
-        self._record_possession("turnover")
+        team = event.get("team", "")
+        possessing_team = "home" if team == self.home_team else "away"
+        self._record_possession(possessing_team, "turnover")
 
     def _handle_end_of_game(self) -> None:
         """
@@ -229,7 +269,7 @@ class GameState(BaseModel):
         self.clock = str(raw_clock)
         self.minutes_elapsed = self._parse_clock(self.clock, self.period)
 
-        # Update team names if this is the first event that carries them.
+        # Update team names on the first event that carries them.
         if event.get("home_team") and not self.home_team:
             self.home_team = str(event["home_team"])
         if event.get("away_team") and not self.away_team:
@@ -246,11 +286,10 @@ class GameState(BaseModel):
         elif event_type in ("end of game", "final"):
             self._handle_end_of_game()
         else:
-            # WHY still record "other" possessions: any unrecognized event that
-            # accompanies a possession (e.g., offensive foul) should still
-            # contribute to the possession stream rather than silently drop.
             if event.get("is_possession_end"):
-                self._record_possession("other")
+                team = event.get("team", "")
+                possessing_team = "home" if team == self.home_team else "away"
+                self._record_possession(possessing_team, "other")
 
         self._update_pace()
         self.updated_at = datetime.utcnow()
