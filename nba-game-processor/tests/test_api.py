@@ -2,13 +2,13 @@
 Integration tests for the FastAPI endpoints.
 
 All Redis calls are mocked — no Redis instance required. Tests verify that
-each endpoint correctly reads from the mocked Redis Hash, computes derived
-metrics, and returns the right status codes.
+each endpoint correctly reads from the mocked Redis, computes derived metrics,
+and returns the right status codes and shapes.
 """
 
 import json
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,7 +27,8 @@ def _make_state_json(overrides: dict | None = None) -> str:
         away_score=72,
         period=3,
         clock="4:22",
-        possession_count=85,
+        home_possessions=44,
+        away_possessions=41,
         minutes_elapsed=28.6,
         pace=142.9,
         last_10_possessions=[
@@ -43,24 +44,28 @@ def _make_state_json(overrides: dict | None = None) -> str:
     return json.dumps(data)
 
 
-def _make_mock_redis(hget_return_value: str | None) -> AsyncMock:
+def _make_mock_redis(
+    hget_return_value: str | None,
+    xrevrange_return_value: list | None = None,
+) -> AsyncMock:
     """
     Build a fully-mocked async Redis client.
 
     WHY mock at the aioredis.from_url level: the lifespan context creates the
-    redis_client via from_url on startup. Patching from_url intercepts the
-    creation before the module-level global is set, ensuring all endpoint
-    calls use the mock rather than attempting a real TCP connection.
+    redis_client via from_url on startup. Patching from_url intercepts creation
+    before the module-level global is set, ensuring all endpoint calls use the
+    mock rather than attempting a real TCP connection.
     """
     mock_redis = AsyncMock()
     mock_redis.ping = AsyncMock(return_value=True)
     mock_redis.hget = AsyncMock(return_value=hget_return_value)
+    mock_redis.xrevrange = AsyncMock(return_value=xrevrange_return_value or [])
     mock_redis.aclose = AsyncMock()
     return mock_redis
 
 
 # ---------------------------------------------------------------------------
-# /state endpoint
+# /state
 # ---------------------------------------------------------------------------
 
 def test_state_returns_200_when_game_exists():
@@ -87,36 +92,32 @@ def test_state_returns_404_when_game_missing():
 
 
 def test_state_contains_all_required_fields():
-    """/state response includes every field defined in the GameState schema."""
+    """/state response includes every field defined in GameState."""
     mock_redis = _make_mock_redis(_make_state_json())
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
             response = client.get("/game/0042300401/state")
     data = response.json()
-    required_fields = [
+    required = [
         "game_id", "home_team", "away_team", "home_score", "away_score",
-        "period", "clock", "possession_count", "pace", "last_10_possessions",
-        "updated_at",
+        "period", "clock", "home_possessions", "away_possessions",
+        "pace", "last_10_possessions", "updated_at",
     ]
-    for field in required_fields:
+    for field in required:
         assert field in data, f"Missing field: {field}"
 
 
 # ---------------------------------------------------------------------------
-# /momentum endpoint
+# /momentum
 # ---------------------------------------------------------------------------
 
 def test_momentum_correct_score_for_known_possessions():
-    """
-    /momentum computes momentum_score as home_scoring - away_scoring.
-    Given last_10 = [home*5, away*2, turnover*3], score = 5 - 2 = 3.
-    """
+    """momentum_score = home_scoring - away_scoring over last 10 possessions."""
     possessions = [
         "home_score", "home_score", "home_score", "home_score", "home_score",
         "away_score", "away_score", "turnover", "turnover", "turnover",
     ]
-    state_json = _make_state_json({"last_10_possessions": possessions})
-    mock_redis = _make_mock_redis(state_json)
+    mock_redis = _make_mock_redis(_make_state_json({"last_10_possessions": possessions}))
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
             response = client.get("/game/0042300401/momentum")
@@ -127,13 +128,12 @@ def test_momentum_correct_score_for_known_possessions():
 
 
 def test_momentum_negative_score_when_away_on_run():
-    """momentum_score is negative when away team is scoring more."""
+    """momentum_score is negative when away team is on a scoring run."""
     possessions = [
         "away_score", "away_score", "away_score", "away_score", "away_score",
         "home_score", "home_score", "turnover", "turnover", "turnover",
     ]
-    state_json = _make_state_json({"last_10_possessions": possessions})
-    mock_redis = _make_mock_redis(state_json)
+    mock_redis = _make_mock_redis(_make_state_json({"last_10_possessions": possessions}))
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
             response = client.get("/game/0042300401/momentum")
@@ -152,14 +152,11 @@ def test_momentum_returns_404_when_game_missing():
 
 
 # ---------------------------------------------------------------------------
-# /pace endpoint
+# /pace
 # ---------------------------------------------------------------------------
 
 def test_pace_returns_correct_differential():
-    """
-    /pace pace_differential = current_pace - 100.0 (league average).
-    At pace 142.9: differential ≈ 42.9.
-    """
+    """pace_differential = current_pace - league_average (100.0)."""
     mock_redis = _make_mock_redis(_make_state_json())
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
@@ -171,7 +168,6 @@ def test_pace_returns_correct_differential():
 
 
 def test_pace_returns_404_when_game_missing():
-    """/pace propagates 404 when the game doesn't exist in Redis."""
     mock_redis = _make_mock_redis(None)
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
@@ -180,18 +176,115 @@ def test_pace_returns_404_when_game_missing():
 
 
 def test_pace_high_pace_interpretation():
-    """Pace significantly above 100 returns a 'high-pace' interpretation."""
-    state_json = _make_state_json({"pace": 115.0})
-    mock_redis = _make_mock_redis(state_json)
+    """Pace > 105 returns a high-pace interpretation string."""
+    mock_redis = _make_mock_redis(_make_state_json({"pace": 115.0}))
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
             response = client.get("/game/0042300401/pace")
     data = response.json()
-    assert "high" in data["interpretation"].lower() or "pace" in data["interpretation"].lower()
+    assert "high" in data["interpretation"].lower()
 
 
 # ---------------------------------------------------------------------------
-# /health endpoint
+# /efficiency
+# ---------------------------------------------------------------------------
+
+def test_efficiency_returns_both_team_ratings():
+    """/efficiency returns offensive ratings for both teams."""
+    # home: 86 pts / 44 possessions * 100 = ~195.5 ORTG (unrealistic mid-game)
+    mock_redis = _make_mock_redis(_make_state_json())
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/efficiency")
+    assert response.status_code == 200
+    data = response.json()
+    assert "home_offensive_rating" in data
+    assert "away_offensive_rating" in data
+    assert "home_ortg_vs_average" in data
+    assert "away_ortg_vs_average" in data
+    assert data["home_team"] == "BOS"
+    assert data["away_team"] == "DAL"
+
+
+def test_efficiency_ortg_formula():
+    """Offensive rating = (score / possessions) * 100."""
+    # home: 50 pts / 50 possessions = 100.0 ORTG
+    state_json = _make_state_json({
+        "home_score": 50, "away_score": 40,
+        "home_possessions": 50, "away_possessions": 50,
+    })
+    mock_redis = _make_mock_redis(state_json)
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/efficiency")
+    data = response.json()
+    assert abs(data["home_offensive_rating"] - 100.0) < 0.1
+    assert abs(data["away_offensive_rating"] - 80.0) < 0.1
+
+
+def test_efficiency_returns_404_when_game_missing():
+    mock_redis = _make_mock_redis(None)
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/9999999999/efficiency")
+    assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /events
+# ---------------------------------------------------------------------------
+
+def test_events_returns_stream_entries():
+    """/events returns the raw stream entries from XREVRANGE."""
+    fake_entries = [
+        ("1717704000000-0", {"event_type": "score", "home_score": "3", "away_score": "0",
+                             "period": "1", "clock": "11:00", "game_id": "0042300401"}),
+        ("1717703990000-0", {"event_type": "period start", "period": "1", "clock": "12:00",
+                             "game_id": "0042300401"}),
+    ]
+    mock_redis = _make_mock_redis(
+        hget_return_value=_make_state_json(),
+        xrevrange_return_value=fake_entries,
+    )
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/events")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 2
+    assert data["events"][0]["stream_id"] == "1717704000000-0"
+    assert data["events"][0]["fields"]["event_type"] == "score"
+
+
+def test_events_returns_404_when_stream_empty():
+    """/events returns 404 when no events exist for the game."""
+    mock_redis = _make_mock_redis(hget_return_value=None, xrevrange_return_value=[])
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/9999999999/events")
+    assert response.status_code == 404
+
+
+def test_events_limit_parameter_is_passed_to_redis():
+    """`limit` query parameter is forwarded to XREVRANGE count."""
+    fake_entries = [
+        ("1717704000000-0", {"event_type": "score", "game_id": "0042300401"}),
+    ]
+    mock_redis = _make_mock_redis(
+        hget_return_value=_make_state_json(),
+        xrevrange_return_value=fake_entries,
+    )
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/events?limit=10")
+    assert response.status_code == 200
+    mock_redis.xrevrange.assert_called_once()
+    call_kwargs = mock_redis.xrevrange.call_args
+    assert call_kwargs.kwargs.get("count") == 10 or 10 in call_kwargs.args
+
+
+# ---------------------------------------------------------------------------
+# /health
 # ---------------------------------------------------------------------------
 
 def test_health_returns_ok():
