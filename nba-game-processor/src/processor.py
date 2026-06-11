@@ -1,13 +1,12 @@
 """
-Redis Stream consumer: reads events, updates GameState, writes snapshot.
+Redis Stream consumer: reads events, updates GameState, writes a snapshot.
 
 This is the hot path of the pipeline. It reads events one at a time from the
-Redis Stream, applies them to a GameState model, and writes the updated state
-back to a Redis Hash that the API reads in O(1).
+Redis Stream, applies them to a GameState, and writes the result to a Redis
+Hash that the API reads in O(1).
 """
 
 import asyncio
-import json
 import logging
 import os
 
@@ -25,49 +24,31 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 STREAM_KEY_TEMPLATE = "game_events:{game_id}"
 STATE_KEY_TEMPLATE = "game_state:{game_id}"
 
-# WHY consumer group named "processors": consumer groups allow multiple
-# processor instances to share the event stream without duplicating work.
-# Today we run one; in production you could add replicas behind a load balancer.
 CONSUMER_GROUP = "processors"
 CONSUMER_NAME = "processor-1"
 
-# WHY 4 hours: NBA games last ~2.5 hours. 4 hours keeps state queryable for
-# post-game analysis without letting Redis grow unboundedly across all games.
+# Keep state queryable for a few hours after a game ends without letting
+# Redis grow unboundedly across all games.
 STATE_TTL_SECONDS = 4 * 60 * 60
 
-# WHY block=1000 (1 second): XREADGROUP blocks until a new message arrives or
-# the timeout expires. 1s means the loop wakes at most once per second when
-# idle — no busy-waiting, but fast enough to be effectively real-time.
+# Wake at most once per second when idle.
 XREADGROUP_BLOCK_MS = 1000
 
-# WHY an artificial per-message delay hook (default 0, off in production):
-# real processing of a single event takes microseconds, which makes it
-# impossible to kill -9 the processor "mid-stream" for a crash-recovery demo —
-# by the time you send the signal, every message is already acked. Setting
-# PROCESSOR_DEMO_DELAY_MS slows down processing enough to reliably observe a
-# message in the pending entries list (XPENDING) before a restart. Zero
-# overhead and zero behavior change when unset.
+# Optional artificial delay per message, used by demo_crash_recovery.py to
+# slow processing enough to reliably kill -9 mid-stream. Off by default.
 PROCESSOR_DEMO_DELAY_MS = int(os.getenv("PROCESSOR_DEMO_DELAY_MS", "0"))
 
 
 async def _ensure_consumer_group(
     redis_client: aioredis.Redis, stream_key: str
 ) -> None:
-    """
-    Create the consumer group if it doesn't already exist.
-
-    WHY XGROUP CREATE with MKSTREAM: MKSTREAM creates the stream key atomically
-    with the group, so the processor can start before the poller pushes the
-    first event — no race condition on startup ordering.
-    """
+    """Create the consumer group (and stream) if it doesn't exist yet."""
     try:
         await redis_client.xgroup_create(
             stream_key, CONSUMER_GROUP, id="0", mkstream=True
         )
         logger.info("Consumer group '%s' created on %s", CONSUMER_GROUP, stream_key)
     except aioredis.ResponseError as exc:
-        # WHY catch ResponseError specifically: Redis raises BUSYGROUP if the
-        # group already exists; that's expected on restart, not an error.
         if "BUSYGROUP" in str(exc):
             logger.debug("Consumer group already exists — continuing.")
         else:
@@ -77,19 +58,10 @@ async def _ensure_consumer_group(
 async def _write_state_snapshot(
     redis_client: aioredis.Redis, state: GameState
 ) -> None:
-    """
-    Serialize GameState to JSON and write it to a Redis Hash with TTL.
-
-    WHY write to Redis Hash instead of leaving state in process memory: the API
-    runs in a separate process and needs to read state. A Hash gives O(1) reads
-    from any process on any machine — this is the materialized view half of the
-    CQRS pattern (stream = write path, hash = read path).
-    """
+    """Serialize GameState to JSON and write it to a Redis Hash with a TTL."""
     state_key = STATE_KEY_TEMPLATE.format(game_id=state.game_id)
     payload = state.model_dump_json()
 
-    # WHY pipeline: HSET + EXPIRE as a pipeline is one round-trip to Redis
-    # instead of two, halving the latency of the write path.
     async with redis_client.pipeline(transaction=True) as pipe:
         pipe.hset(state_key, mapping={"data": payload})
         pipe.expire(state_key, STATE_TTL_SECONDS)
@@ -99,16 +71,7 @@ async def _write_state_snapshot(
 async def _load_state_snapshot(
     redis_client: aioredis.Redis, game_id: str
 ) -> GameState | None:
-    """
-    Load a previously written state snapshot, if one exists.
-
-    WHY this is required for crash recovery: messages already XACKed before a
-    crash are gone from the pending entries list (PEL) by design — re-reading
-    them would double-count possessions and scores. Rehydrating from the last
-    materialized snapshot picks up exactly where the previous run left off;
-    only messages still in the PEL (delivered but unacked) get reprocessed
-    on top of it.
-    """
+    """Load the last materialized snapshot, if one exists, for crash recovery."""
     state_key = STATE_KEY_TEMPLATE.format(game_id=game_id)
     raw = await redis_client.hget(state_key, "data")
     if raw is None:
@@ -122,13 +85,12 @@ async def _drain_pending_messages(
     """
     Reprocess any messages left in this consumer's pending entries list (PEL).
 
-    WHY id="0" instead of ">": ">" means "messages never delivered to any
-    consumer in this group" — it does NOT redeliver a message already
+    XREADGROUP with id=">" only returns messages never delivered to any
+    consumer in this group — it does not redeliver a message already
     delivered to (and still pending for) this same consumer. After a crash,
-    those messages are exactly what XPENDING shows as outstanding for
-    "processor-1". Reading with id="0" asks Redis for this consumer's own
-    PEL, oldest first, so they're applied (and finally acked) before any new
-    events are consumed.
+    those are exactly the messages XPENDING shows as outstanding. Reading
+    with id="0" asks Redis for this consumer's own PEL, oldest first, so
+    they're applied (and acked) before any new events are consumed.
     """
     while True:
         results = await redis_client.xreadgroup(
@@ -157,50 +119,31 @@ async def _process_message(
     fields: dict,
     state: GameState,
 ) -> GameState:
-    """
-    Apply one stream message to the game state and acknowledge it.
-
-    WHY XACK after processing, not before: this is at-least-once delivery.
-    If the processor crashes between receive and ack, Redis redelivers the
-    message on restart. Processing an event twice is safe (score won't change
-    if the delta is 0); dropping an event silently would corrupt state.
-    """
+    """Apply one stream message to the game state and acknowledge it."""
     if PROCESSOR_DEMO_DELAY_MS:
         await asyncio.sleep(PROCESSOR_DEMO_DELAY_MS / 1000.0)
 
     state.update(fields)
     await _write_state_snapshot(redis_client, state)
 
-    # WHY ack after the snapshot write: if we acked before writing, a crash
-    # between ack and write would leave Redis Hash with stale state and no
-    # way to recover the missed event.
+    # Ack after the snapshot write: this is at-least-once delivery, so a
+    # crash before the ack just means the message is reprocessed on restart.
+    # Acking before the write would risk a stale snapshot with no way to
+    # recover the missed event.
     await redis_client.xack(stream_key, CONSUMER_GROUP, message_id)
     logger.debug("Processed and acked message %s", message_id)
     return state
 
 
 async def process_game(game_id: str) -> None:
-    """
-    Main consumer loop: read events from stream and maintain game state.
-
-    WHY consumer groups instead of basic XREAD: consumer groups persist the
-    last-acknowledged offset per consumer. On restart, draining this
-    consumer's PEL with id="0" (see _drain_pending_messages) replays any
-    messages that were delivered but never acked before a crash, then ">"
-    resumes consuming new messages. Basic XREAD would require storing the
-    offset externally or risk reprocessing the entire stream from the
-    beginning.
-    """
+    """Main consumer loop: read events from the stream and maintain game state."""
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     stream_key = STREAM_KEY_TEMPLATE.format(game_id=game_id)
 
     await _ensure_consumer_group(redis_client, stream_key)
 
-    # WHY rehydrate from the last snapshot instead of always starting fresh:
-    # on a clean first run there's nothing to load and we start from a zero
-    # GameState as before. On restart after a crash, this restores the state
-    # as of the last successful ack so that replaying PEL messages doesn't
-    # double-count already-acked possessions.
+    # Rehydrate from the last snapshot (if any) so that replaying PEL
+    # messages after a restart doesn't double-count already-acked events.
     state = await _load_state_snapshot(redis_client, game_id)
     if state is None:
         state = GameState(game_id=game_id)
@@ -210,9 +153,6 @@ async def process_game(game_id: str) -> None:
 
     try:
         while state.game_status != "final":
-            # WHY ">" as the start ID: in consumer groups, ">" means "give me
-            # messages not yet delivered to any consumer". Previously unacked
-            # messages are delivered automatically before new ones.
             results = await redis_client.xreadgroup(
                 groupname=CONSUMER_GROUP,
                 consumername=CONSUMER_NAME,
@@ -222,8 +162,6 @@ async def process_game(game_id: str) -> None:
             )
 
             if not results:
-                # WHY continue on empty result: block=1000 means we waited 1s
-                # and no events arrived. Loop again — the game may just be slow.
                 continue
 
             for _stream, messages in results:
@@ -240,14 +178,6 @@ async def process_game(game_id: str) -> None:
 
 
 def run(game_id: str) -> None:
-    """
-    Entry point for running the processor as a standalone process.
-
-    WHY separate process from poller: if the processor has a bug and crashes,
-    events keep accumulating in the stream without being lost. When the
-    processor restarts it picks up exactly where it left off via the consumer
-    group's persisted offset.
-    """
     asyncio.run(process_game(game_id))
 
 

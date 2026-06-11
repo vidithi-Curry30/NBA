@@ -176,7 +176,7 @@ def test_pace_formula():
 
     Formula: ((home + away) / 2 / minutes_elapsed) * 48
     At 10 home + 10 away possessions in 10 minutes: pace = (10/10)*48 = 48.
-    WHY /2: NBA pace is per-team per 48 min, not combined possessions.
+    Divide by 2 because pace is per-team per 48 min, not combined possessions.
     """
     state = make_base_state()
     state.home_possessions = 10

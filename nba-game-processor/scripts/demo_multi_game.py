@@ -1,16 +1,7 @@
 """
-Multi-game horizontal scaling demo: run two independent processor instances
-concurrently, each consuming a different game's Redis Stream.
-
-WHY this demo exists: a single processor handling one game_id is the unit of
-work in this architecture. Horizontal scaling here means running N of these
-units in parallel — they share nothing (separate stream keys, separate
-consumer groups via separate stream keys, separate Redis Hash keys), so
-adding capacity for more concurrent games is just "run another processor
-process with a different game_id argument". This script proves that with two
-games processed in parallel by two separate `python -m src.processor`
-subprocesses, both reach correct final state independently and the API can
-serve both simultaneously.
+Multi-game scaling demo: run two processor instances concurrently, each
+consuming a different game's Redis Stream, and check both reach the correct
+final state independently.
 
 Run with Redis available locally:
 
@@ -109,9 +100,8 @@ async def main() -> None:
 
     print(
         "\nBoth games reached the correct final score independently and "
-        "concurrently — adding processing capacity for more simultaneous "
-        "games is purely horizontal: run another `python -m src.processor "
-        "<game_id>` process. No shared state or coordination between them."
+        "concurrently. Adding capacity for more simultaneous games just "
+        "means running another `python -m src.processor <game_id>` process."
     )
 
 
