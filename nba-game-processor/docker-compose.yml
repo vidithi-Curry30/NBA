@@ -5,9 +5,7 @@ services:
     image: redis:7.2-alpine
     ports:
       - "6379:6379"
-    # WHY named volume: data persists across `docker-compose down` / restart.
-    # Without it, all stream events and game state are lost on container stop —
-    # fine for development but not for a demo that runs across multiple sessions.
+    # Persist stream/state data across `docker-compose down` / restart.
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -22,9 +20,6 @@ services:
     command: uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
-    # WHY depends_on with condition: ensures Redis is healthy before the API
-    # starts, so the startup health check in api.py actually verifies a live
-    # connection rather than always failing on first launch.
     depends_on:
       redis:
         condition: service_healthy

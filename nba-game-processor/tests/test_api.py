@@ -49,12 +49,8 @@ def _make_mock_redis(
     xrevrange_return_value: list | None = None,
 ) -> AsyncMock:
     """
-    Build a fully-mocked async Redis client.
-
-    WHY mock at the aioredis.from_url level: the lifespan context creates the
-    redis_client via from_url on startup. Patching from_url intercepts creation
-    before the module-level global is set, ensuring all endpoint calls use the
-    mock rather than attempting a real TCP connection.
+    Build a fully-mocked async Redis client, patched in at aioredis.from_url
+    so the lifespan startup hook picks it up instead of a real connection.
     """
     mock_redis = AsyncMock()
     mock_redis.ping = AsyncMock(return_value=True)

@@ -1,10 +1,5 @@
 """
-Measure real /state endpoint latency and throughput against a running API.
-
-WHY a small async script instead of `ab`/`locust`: neither is installable in
-this sandbox (no apt package mirror, no PyPI access for locust). `httpx`
-is already a project dependency, so this gives real, reproducible numbers
-without adding new tooling.
+Measure /state endpoint latency and throughput against a running API.
 
 Usage (with `uvicorn src.api:app` and Redis already running, and at least one
 game's state populated, e.g. via scripts/demo_multi_game.py):
@@ -34,8 +29,7 @@ async def run(host: str, game_id: str, total_requests: int, concurrency: int) ->
     latencies: list[float] = []
 
     async with httpx.AsyncClient() as client:
-        # WHY a warmup request: the first request pays connection-pool setup
-        # cost; excluding it from the measured sample avoids skewing p50/p99.
+        # Warm up the connection pool before timing.
         await client.get(url)
 
         start = time.perf_counter()

@@ -1,6 +1,9 @@
 # nba-game-processor
 
-A real-time NBA game state processor that ingests live play-by-play events from `nba_api`, maintains running game state (score, pace, momentum, on-court lineups), and serves it through a REST API with sub-10ms query latency. The system uses Redis Streams as a persistent, observable message queue between a poller process and a processor process — a deliberate architectural choice that provides crash recovery, component decoupling, and independent observability. The API reads exclusively from a Redis Hash materialized view maintained by the processor, implementing the CQRS pattern (Command Query Responsibility Segregation) to keep read latency O(1) regardless of how many events have been processed. A replay mode feeds historical play-by-play through the identical live pipeline, making it simultaneously a demo tool and an integration test.
+A real-time NBA game state processor. It ingests play-by-play events (live or
+replayed historical games), maintains running game state (score, pace,
+momentum, on-court lineups) in Redis, and serves it through a FastAPI REST
+API.
 
 ---
 
@@ -29,65 +32,28 @@ nba_api (live or historical)
                                                                 │
                                                                 ▼
                                                            api.py
-                                                           (FastAPI,
-                                                            sub-10ms
-                                                            responses)
+                                                           (FastAPI)
                                                                 │
                                                                 ▼
                                                             client
 ```
 
----
+The poller and processor are separate processes connected only through
+Redis. The poller's only job is pulling new events from `nba_api` and
+appending them to a stream; the processor consumes that stream, updates a
+`GameState` model, and writes the result to a Redis Hash. The API reads only
+from that hash (CQRS-style: stream is the write path, hash is the read path),
+so a query never has to replay history — it's always an O(1) `HGET`.
 
-## Design Decisions
+This split also gives crash recovery for free. If the processor dies, events
+keep accumulating in the stream; on restart it drains its pending entries
+list (PEL) and picks up where it left off. `scripts/demo_crash_recovery.py`
+exercises this end to end.
 
-### Why Redis Streams instead of an in-process queue
-
-Redis Streams provide three properties that `asyncio.Queue` cannot: **persistence** (events survive a processor crash and are replayed on restart via consumer group offsets), **observability** (the stream can be inspected with `XRANGE` independently of both the poller and processor — you can see exactly what's in the queue without touching either component), and **decoupling** (the poller and processor share zero code and communicate only through Redis, so either can be restarted, scaled, or replaced without affecting the other). An `asyncio.Queue` would be simpler but would couple both components in the same process, losing all three of these properties the moment the process restarts.
-
-### Why separate poller and processor processes
-
-Fault isolation: if `nba_api` is slow or throws rate-limit errors, the poller backs off and retries without affecting the processor — events already in the stream continue to be consumed normally. Conversely, if the processor has a bug and crashes, events keep accumulating in the stream without being dropped, and the processor picks up exactly where it left off when it restarts. Each component has a single, clearly bounded responsibility, which maps directly to the Single Responsibility Principle that appears in every Big Tech system design interview.
-
-### Why the API reads from Redis Hash and not the Stream
-
-The stream is the authoritative event log, but it's append-only and sequential — computing current state from it requires replaying every event from the beginning, which is O(n) in the number of events. After processing each event, the processor writes a complete JSON snapshot of current state to a Redis Hash; the API reads from this hash in O(1) regardless of whether 10 or 10,000 events have occurred. This is the **CQRS pattern**: the stream is the write path, the hash is the read path. Separating them means the read path scales independently — you could add read replicas, caching, or CDN fronting without touching the event processing logic.
-
-### Why a logistic regression for win probability, not XGBoost/a neural net
-
-`src/win_probability.py` serves a `LogisticRegression` trained on simulated
-possession-by-possession trajectories (`scripts/train_win_probability.py`).
-With three features — score differential, minutes remaining, and their
-interaction term `score_diff / sqrt(minutes_remaining + 1)` — the relationship
-to P(home win) is close to linear-in-the-logit by construction (it's literally
-how the simulator's win labels are generated). A gradient-boosted tree or
-neural net would add training time, inference latency, and a model file an
-order of magnitude larger, for an accuracy gain that's within noise on a
-3-feature problem. Logistic regression is also the *interpretable* choice:
-the fitted coefficients can be read directly off `joblib.load(...)['model'].coef_`
-and explained in one sentence each — the `score_diff_over_sqrt_time`
-coefficient (+0.85) directly encodes "how much a fixed lead matters as time
-runs out." Start simple; only reach for a more complex model if accuracy,
-log loss, or Brier score on held-out data demonstrate simple is insufficient.
-
-### Why simulated training data instead of real nba_api play-by-play
-
-`stats.nba.com` (the source of historical play-by-play via `nba_api`) is
-rate-limited and unreachable from this development environment — verified
-with a direct request that returned a 503 and a `PlayByPlayV2` call that timed
-out after 10s. Rather than block the model on external network access, the
-training script Monte Carlo-simulates ~3,000 games possession-by-possession,
-calibrated so simulated team shooting percentages produce a league-average
-offensive rating of ~113 (matching `LEAGUE_AVERAGE_OFFENSIVE_RATING` in
-`src/metrics.py`) and a league-average pace of ~100 (matching
-`LEAGUE_AVERAGE_PACE`). The feature schema and training code are identical
-either way — `scripts/train_win_probability.py` documents exactly how to
-re-point `generate_training_data` at real historical games once network access
-is available, with zero changes to `src/win_probability.py` or the API.
-
-### Why Python and not C++
-
-Every component in this system is I/O-bound: polling an HTTP API, reading and writing to Redis over a network socket, serving HTTP responses. C++ only provides meaningful performance benefit on CPU-bound hot paths. The [Monte Carlo Equity Simulator](https://github.com/vidithi-curry30) on this GitHub already demonstrates CPU-bound C++ systems programming with lock-free SPSC queues, xoshiro256++ RNG, and a custom thread pool. Adding C++ here would be forced — all the latency is in network I/O, not computation — and the decision wouldn't be defensible under interview questioning. Knowing *when not to use a tool* is as important as knowing when to use it.
+A replay mode (`src/replay.py`) feeds a completed game's play-by-play through
+the same stream the live poller writes to, at a configurable speed multiplier
+— useful for development and for the demos below since it doesn't depend on
+a game being in progress.
 
 ---
 
@@ -149,7 +115,7 @@ List available completed games:
 python -m src.replay --list-games
 ```
 
-Replay at 20x speed (with processor running in a separate terminal):
+Replay at 20x speed (with the processor running in a separate terminal):
 
 ```bash
 # Terminal 1: processor
@@ -165,7 +131,7 @@ python -m src.replay --game 0042300401 --speed 20
 
 ### `GET /game/{game_id}/state`
 
-Returns full current GameState.
+Returns the full current GameState.
 
 ```bash
 curl http://localhost:8000/game/0042300401/state
@@ -189,9 +155,9 @@ curl http://localhost:8000/game/0042300401/state
 
 ### `GET /game/{game_id}/win-probability`
 
-Returns P(home team wins), from a logistic regression trained on simulated
-game trajectories (see "Why a logistic regression" above). On a `final` game,
-the result is deterministic (1.0/0.0), not a model estimate.
+P(home team wins), from a logistic regression trained on real play-by-play
+(see "Win probability model" below). On a `final` game the result is
+deterministic (1.0/0.0), not a model estimate.
 
 ```bash
 curl http://localhost:8000/game/0042300401/win-probability
@@ -210,10 +176,9 @@ curl http://localhost:8000/game/0042300401/win-probability
 
 ### `GET /game/{game_id}/momentum`
 
-Returns last 10 possessions, a momentum score (positive = home team on a run),
-and a z-score that tests whether the split is statistically significant
-against the null hypothesis that scoring possessions are a 50/50 coin flip
-(`|z| > 1.5` flags a real run; see "Why a z-score" in Design Decisions).
+Last 10 possessions, a momentum score (positive = home team on a run), and a
+z-score testing whether the split is significant against a 50/50 null
+(`|z| > 1.5` flags a real run).
 
 ```bash
 curl http://localhost:8000/game/0042300401/momentum
@@ -231,7 +196,7 @@ curl http://localhost:8000/game/0042300401/momentum
 
 ### `GET /game/{game_id}/pace`
 
-Returns current pace vs. league average (100.0 possessions per 48 min).
+Current pace vs. league average (100.0 possessions per 48 min).
 
 ```bash
 curl http://localhost:8000/game/0042300401/pace
@@ -249,8 +214,8 @@ curl http://localhost:8000/game/0042300401/pace
 
 ### `GET /game/{game_id}/efficiency`
 
-Returns offensive rating (points per 100 possessions) for both teams vs. the
-2023-24 league average of ~113.
+Offensive rating (points per 100 possessions) for both teams vs. the 2023-24
+league average of ~113.
 
 ```bash
 curl http://localhost:8000/game/0042300401/efficiency
@@ -271,9 +236,8 @@ curl http://localhost:8000/game/0042300401/efficiency
 
 ### `GET /game/{game_id}/events`
 
-Returns the most recent raw events from the Redis Stream — the append-only
-audit log. This is the one O(n) endpoint, intended for debugging/inspection
-rather than the hot query path; `limit` (default 50, max 500) bounds the cost.
+Most recent raw events from the Redis Stream (the audit log). The only O(n)
+endpoint; `limit` (default 50, max 500) bounds the cost.
 
 ```bash
 curl "http://localhost:8000/game/0042300401/events?limit=10"
@@ -292,12 +256,43 @@ curl "http://localhost:8000/game/0042300401/events?limit=10"
 
 ### `GET /health`
 
-Lightweight health check used by Fly.io and Docker health probes.
-
 ```bash
 curl http://localhost:8000/health
 # {"status": "ok"}
 ```
+
+---
+
+## Win probability model
+
+`src/win_probability.py` serves a `LogisticRegression` over three features:
+score differential, minutes remaining, and the interaction term
+`score_diff / sqrt(minutes_remaining + 1)` (a fixed lead matters more as time
+runs out).
+
+The model is trained on real play-by-play from ~150 completed games, fetched
+from `cdn.nba.com`'s live-data endpoints by `scripts/fetch_training_games.py`
+(`stats.nba.com`, which `nba_api`'s historical endpoints normally use, is not
+reachable from this environment, but the live-data CDN is and serves
+play-by-play for completed games too). Each game contributes a snapshot every
+few events — `(score_diff, minutes_remaining)` at that point in the game,
+labeled with the actual final outcome — giving about 29,000 training
+examples. The cached dataset is checked into `data/wp_training_data.csv` so
+`scripts/train_win_probability.py` can be re-run without network access; pass
+`--games N` to `fetch_training_games.py` to pull a larger or more recent
+sample.
+
+```bash
+python -m scripts.fetch_training_games --games 150  # optional, refreshes the CSV
+python -m scripts.train_win_probability
+```
+
+A 3-feature logistic regression is the right starting point here: the
+relationship between (score differential, time remaining) and win probability
+is close to linear in the logit, the model is small enough for sub-millisecond
+inference, and the fitted coefficients are directly interpretable (e.g. the
+`score_diff_over_sqrt_time` coefficient says how much a fixed lead matters as
+the clock runs down).
 
 ---
 
@@ -310,8 +305,7 @@ starts the processor, `SIGKILL`s it mid-stream, and shows that Redis's
 consumer-group pending entries list (PEL) still holds the in-flight,
 unacknowledged messages. Restarting the processor drains the PEL (via
 `XREADGROUP ... id="0"`) before resuming new messages with `">"`, and the
-final state is verified to be exactly correct — no event lost, none
-double-applied.
+final state is verified to be exactly correct.
 
 ```bash
 python -m scripts.demo_crash_recovery
@@ -325,19 +319,12 @@ Final score 8-6 matches expected 8-6: every event was applied exactly once,
 despite the mid-stream crash.
 ```
 
-Building this demo surfaced a real bug: `XREADGROUP` with id `">"` does
-**not** redeliver a consumer's own pending messages after a restart — only
-`id="0"` does. The fix (draining the PEL on startup, plus rehydrating the
-last materialized snapshot before replaying it) is in `src/processor.py`.
-
-### Multi-game horizontal scaling
+### Multi-game scaling
 
 `scripts/demo_multi_game.py` seeds two different games and starts two
 independent `python -m src.processor <game_id>` subprocesses concurrently —
-one per game, sharing nothing (separate stream keys, separate consumer
-groups, separate Redis Hash keys). Both reach correct final state
-independently, demonstrating that adding capacity for more concurrent games
-is purely horizontal.
+one per game, sharing nothing (separate stream keys, consumer groups, and
+state hashes). Both reach correct final state independently.
 
 ```bash
 python -m scripts.demo_multi_game
@@ -356,15 +343,16 @@ demo_multi_b: LAL 3 - 5 GSW (status=final)
 pytest tests/ -v
 ```
 
-No Redis or `nba_api` connection required — all external dependencies are mocked.
+No Redis or `nba_api` connection required — all external dependencies are
+mocked.
 
 ---
 
 ## Benchmarks
 
 Measured with `scripts/benchmark_api.py` against `uvicorn src.api:app` and
-Redis both running locally in this repo's dev container (1000 requests,
-concurrency 10, against `/game/{id}/state` for a populated game):
+Redis both running locally (1000 requests, concurrency 10, against
+`/game/{id}/state` for a populated game):
 
 ```bash
 python -m scripts.demo_multi_game   # populate a game's state
@@ -380,22 +368,10 @@ python -m scripts.benchmark_api --host http://localhost:8001 --game demo_multi_a
 | Mean latency | 18.8ms | 1.9ms |
 | Throughput | ~498 req/s | — |
 
-These numbers are from a single uvicorn worker with `--reload`-free defaults
-on shared sandbox hardware — not a tuned production deployment, and the long
-`/state` p99 tail is consistent with Python's GIL serializing requests on a
-single worker under concurrency 10. The `/win-probability` numbers (measured
-sequentially, no concurrency) show what the same machine does for a request
-that's pure CPU (`predict_proba` on a 3-feature logistic regression) plus the
-same Redis `HGET` — under 2ms even on this hardware, confirming the model
-inference itself is not the bottleneck.
-
-In production, this scales horizontally and vertically: `uvicorn --workers N`
-adds parallel processes (sidesteps the GIL for I/O-bound request handling),
-and the Redis `HGET` is O(1) regardless of how many events have been
-processed for a game. `apache2-utils`/`locust` weren't installable in this
-sandboxed environment (no package mirror access); `scripts/benchmark_api.py`
-uses `httpx`, an existing dependency, to produce the numbers above without
-new tooling.
+These are from a single uvicorn worker without `--reload`. The `/state` p99
+tail is consistent with a single worker serializing requests under
+concurrency. `uvicorn --workers N` adds parallel processes for the I/O-bound
+request path; the Redis `HGET` stays O(1) regardless of game length.
 
 ---
 
@@ -407,4 +383,6 @@ fly secrets set REDIS_URL=redis://your-redis-url:6379
 fly deploy
 ```
 
-The `/health` endpoint is configured as the Fly.io health check path in `fly.toml`. The app auto-stops when idle and auto-starts on the first request (configured via `auto_stop_machines = true`).
+The `/health` endpoint is configured as the Fly.io health check path in
+`fly.toml`. The app auto-stops when idle and auto-starts on the first request
+(`auto_stop_machines = true`).

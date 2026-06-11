@@ -2,18 +2,12 @@
 Crash-recovery demo: kill the processor mid-stream and show it resumes
 cleanly via the consumer group's pending entries list (PEL).
 
-WHY this demo exists: "the system survives a crash" is a claim every README
-makes and almost none demonstrate. This script makes the at-least-once
-delivery guarantee from src/processor.py observable end-to-end:
-
   1. Push a full game's worth of synthetic events to a fresh Redis Stream.
-  2. Start the processor as a subprocess and let it consume a few events.
-  3. SIGKILL it mid-processing — simulating a crash, not a clean shutdown.
-  4. Run XPENDING to show Redis still holds the in-flight, unacknowledged
-     message (the PEL) — proof no event was silently dropped.
-  5. Restart the processor. XREADGROUP delivers the pending message first,
-     then continues with new ones, with no special recovery code required.
-  6. Verify the final materialized state reflects every event exactly once.
+  2. Start the processor and let it consume a few events.
+  3. SIGKILL it mid-processing, simulating a crash.
+  4. Run XPENDING to show the unacked message is still held (PEL).
+  5. Restart the processor — it drains the PEL before consuming new events.
+  6. Verify the final state reflects every event exactly once.
 
 Run with Redis available locally:
 
@@ -36,9 +30,6 @@ STREAM_KEY = f"game_events:{GAME_ID}"
 STATE_KEY = f"game_state:{GAME_ID}"
 CONSUMER_GROUP = "processors"
 
-# WHY 8 events: enough to have several in flight when we kill the processor
-# (at PROCESSOR_DEMO_DELAY_MS=300 each), short enough the demo finishes in
-# under 30 seconds.
 EVENTS = [
     {"event_type": "period start", "period": "1", "clock": "12:00",
      "home_team": "BOS", "away_team": "DAL", "game_id": GAME_ID},
@@ -112,8 +103,7 @@ async def main() -> None:
     await _push_all_events(redis_client)
     print(f"Pushed {len(EVENTS)} events to {STREAM_KEY}.")
 
-    # WHY PROCESSOR_DEMO_DELAY_MS=300: slows each event enough that we can
-    # reliably kill -9 the process partway through the stream.
+    # 300ms/event slows the processor enough to reliably SIGKILL it mid-stream.
     print("\nStarting processor (run #1, with artificial 300ms/event delay)...")
     proc = _spawn_processor({"PROCESSOR_DEMO_DELAY_MS": "300"})
 
