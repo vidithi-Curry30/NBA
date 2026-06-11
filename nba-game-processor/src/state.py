@@ -6,7 +6,9 @@ and how raw play-by-play events mutate it. Keeping state transitions here
 (not in processor.py) means the logic can be unit tested without Redis.
 """
 
+from collections import deque
 from datetime import datetime
+from typing import Deque
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -49,10 +51,14 @@ class GameState(BaseModel):
     home_possessions: int = 0
     away_possessions: int = 0
 
-    # WHY cap at 10: long enough for a meaningful momentum signal (3+ possessions
-    # is noise; 10 is a mini-quarter's worth), short enough to reflect current
-    # game state rather than first-half history.
-    last_10_possessions: list[str] = Field(default_factory=list)
+    # WHY deque(maxlen=10) instead of list with manual pop(0): list.pop(0) is
+    # O(n) because every remaining element shifts left in memory. deque is a
+    # doubly-linked list of blocks — append and evict-from-front are both O(1).
+    # maxlen=10 makes the eviction automatic, eliminating the manual truncation
+    # logic entirely. WHY 10: long enough for a meaningful momentum signal
+    # (3+ possessions is noise; 10 is a mini-quarter's worth), short enough to
+    # reflect current game state rather than first-half history.
+    last_10_possessions: Deque[str] = Field(default_factory=lambda: deque(maxlen=10))
 
     # WHY pace as float: possessions per 48 minutes per team. League average is
     # ~100. Pace contextualizes score — a 120-110 game at pace 115 is a blowout;
@@ -136,11 +142,9 @@ class GameState(BaseModel):
         elif team == "away":
             self.away_possessions += 1
 
+        # WHY no manual truncation: deque(maxlen=10) automatically evicts the
+        # oldest entry from the front when a new one is appended past capacity.
         self.last_10_possessions.append(outcome)
-        # WHY pop from front not back: the list is ordered oldest-first;
-        # we want the 10 *most recent* entries, so we drop the oldest.
-        if len(self.last_10_possessions) > 10:
-            self.last_10_possessions.pop(0)
 
     def _handle_score_change(self, event: dict) -> None:
         """

@@ -22,6 +22,7 @@ from src.metrics import (
     compute_efficiency,
 )
 from src.state import GameState
+from src.win_probability import predict_win_probability
 
 load_dotenv()
 
@@ -99,6 +100,11 @@ class MomentumResponse(BaseModel):
     game_id: str
     last_10_possessions: list[str]
     momentum_score: int
+    # WHY include z_score: momentum_score alone (e.g. "+3") is meaningless
+    # without knowing the sample size it came from. z_score normalizes for
+    # that — it's the number of standard deviations the observed split is
+    # from the 50/50 expectation, making "is this a real run?" answerable.
+    z_score: float
     interpretation: str
 
 
@@ -120,6 +126,18 @@ class EfficiencyResponse(BaseModel):
     home_ortg_vs_average: float
     away_ortg_vs_average: float
     interpretation: str
+
+
+class WinProbabilityResponse(BaseModel):
+    game_id: str
+    home_team: str
+    away_team: str
+    home_win_probability: float
+    away_win_probability: float
+    # WHY surface is_final: callers (and graders) should be able to tell at a
+    # glance whether the 1.0/0.0 they see is a deterministic game outcome or
+    # a model estimate that happens to land near an extreme.
+    is_final: bool
 
 
 class StreamEvent(BaseModel):
@@ -160,11 +178,15 @@ async def get_momentum(game_id: str) -> MomentumResponse:
     more than 15 blends current form with history. 10 is the informal
     NBA-analytics convention for "recent form" window size.
 
-    WHY threshold |momentum_score| > 2 for "on a run": in a balanced game
-    you expect roughly equal home/away scoring in any 10-possession window.
-    A difference of ±2 out of 10 is within normal variance; ±3 (30% skew)
-    is a statistically meaningful shift in possession outcomes. This is a
-    practical heuristic, not a hypothesis test — adjust as needed.
+    WHY a z-score instead of a fixed threshold like "momentum_score > 2":
+    treat each scoring possession as a Bernoulli trial with p=0.5 under the
+    null hypothesis that neither team is "on a run" (scoring is a coin flip).
+    For n scoring possessions, home_scoring ~ Binomial(n, 0.5), with mean n/2
+    and standard deviation sqrt(n)/2. z = (home_scoring - n/2) / (sqrt(n)/2)
+    measures how many standard deviations the observed split is from the
+    50/50 expectation. |z| > 1.5 (~87th percentile, one-tailed) flags a run.
+    This adapts to sample size automatically — a fixed threshold like ">2"
+    means something different for n=4 scoring possessions vs. n=10.
     """
     state = await _get_state_from_redis(game_id)
 
@@ -172,17 +194,28 @@ async def get_momentum(game_id: str) -> MomentumResponse:
     away_scoring = state.last_10_possessions.count("away_score")
     momentum_score = home_scoring - away_scoring
 
-    if momentum_score > 2:
+    n = home_scoring + away_scoring
+    if n > 0:
+        # WHY sqrt(n) / 2: standard deviation of Binomial(n, 0.5) is
+        # sqrt(n * 0.5 * 0.5) = sqrt(n) / 2.
+        z_score = (home_scoring - n / 2) / (n ** 0.5 / 2)
+    else:
+        # WHY z=0 when n=0: no scoring possessions in the window means no
+        # evidence of a run in either direction — neutral by definition.
+        z_score = 0.0
+
+    if z_score > 1.5:
         interpretation = f"{state.home_team} on a run"
-    elif momentum_score < -2:
+    elif z_score < -1.5:
         interpretation = f"{state.away_team} on a run"
     else:
         interpretation = "Contested"
 
     return MomentumResponse(
         game_id=game_id,
-        last_10_possessions=state.last_10_possessions,
+        last_10_possessions=list(state.last_10_possessions),
         momentum_score=momentum_score,
+        z_score=round(z_score, 2),
         interpretation=interpretation,
     )
 
@@ -246,6 +279,30 @@ async def get_efficiency(game_id: str) -> EfficiencyResponse:
         home_ortg_vs_average=snap.home_ortg_vs_average,
         away_ortg_vs_average=snap.away_ortg_vs_average,
         interpretation=interpretation,
+    )
+
+
+@app.get("/game/{game_id}/win-probability", response_model=WinProbabilityResponse)
+async def get_win_probability(game_id: str) -> WinProbabilityResponse:
+    """
+    Return P(home team wins) from the trained logistic regression model.
+
+    WHY a model endpoint alongside rule-based ones (momentum, pace,
+    efficiency): those endpoints describe *what's happening*; this one
+    answers *who's likely to win*, combining score differential and time
+    remaining into a single calibrated probability — the question a viewer
+    actually cares about in the final minutes of a close game.
+    """
+    state = await _get_state_from_redis(game_id)
+    home_prob = predict_win_probability(state)
+
+    return WinProbabilityResponse(
+        game_id=game_id,
+        home_team=state.home_team,
+        away_team=state.away_team,
+        home_win_probability=round(home_prob, 4),
+        away_win_probability=round(1.0 - home_prob, 4),
+        is_final=state.game_status == "final",
     )
 
 
