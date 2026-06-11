@@ -1,9 +1,6 @@
 """
-CLI tool for inspecting Redis Stream contents directly.
-
-This is the proof-of-concept for the observability claim: the stream can be
-inspected independently of both the poller and the processor. Run this while
-the pipeline is live to see exactly what events are in the queue.
+CLI tool for inspecting Redis Stream contents directly, independently of
+the poller and processor.
 
 Usage:
     python scripts/inspect_stream.py --game 0042300401
@@ -45,20 +42,13 @@ def _fmt_event(msg_id: str, fields: dict) -> str:
 
 
 async def _inspect(game_id: str, tail: int, follow: bool) -> None:
-    """
-    Read stream entries and print them; optionally poll for new entries.
-
-    WHY XRANGE for history and XREAD for follow mode: XRANGE reads a fixed
-    range efficiently. XREAD with BLOCK allows waiting for new entries without
-    busy-polling — the same pattern the processor uses with XREADGROUP.
-    """
+    """Print recent stream entries, optionally polling for new ones."""
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     stream_key = STREAM_KEY_TEMPLATE.format(game_id=game_id)
 
     try:
-        # WHY XREVRANGE then reverse: we want the last `tail` entries without
-        # scanning from the beginning. XREVRANGE returns newest-first so we
-        # re-reverse for chronological display.
+        # XREVRANGE gets the last `tail` entries (newest first) without
+        # scanning from the start; reverse for chronological display.
         entries = await redis_client.xrevrange(stream_key, count=tail)
         if not entries:
             click.echo(f"No events found for game {game_id}. Is the poller running?")
@@ -79,9 +69,7 @@ async def _inspect(game_id: str, tail: int, follow: bool) -> None:
         last_id = entries[-1][0] if entries else "0"
 
         while True:
-            # WHY block=2000: 2-second timeout keeps the loop responsive to
-            # Ctrl-C without busy-waiting. The poller pushes every 3s, so 2s
-            # granularity won't miss events.
+            # 2s timeout keeps this responsive to Ctrl-C without busy-waiting.
             new_entries = await redis_client.xread(
                 streams={stream_key: last_id}, count=50, block=2000
             )
@@ -102,14 +90,7 @@ async def _inspect(game_id: str, tail: int, follow: bool) -> None:
 @click.option("--tail", default=50, show_default=True, help="Number of recent events to show")
 @click.option("--follow", is_flag=True, help="Keep watching for new events (like tail -f)")
 def main(game: str, tail: int, follow: bool) -> None:
-    """
-    Inspect the Redis Stream for a game — observability without touching the pipeline.
-
-    WHY this script exists: one of the key advantages of Redis Streams over an
-    in-process queue is that the stream can be inspected independently. This
-    script proves that claim — it reads directly from the stream without
-    importing any pipeline code.
-    """
+    """Inspect the Redis Stream for a game without touching the pipeline."""
     try:
         asyncio.run(_inspect(game, tail, follow))
     except KeyboardInterrupt:

@@ -1,24 +1,19 @@
 """
 Replay mode: feed historical play-by-play through the live pipeline.
 
-This script fetches a completed game's events from nba_api and pushes them
-through the IDENTICAL Redis Stream used by the live poller. The processor
-consumes them exactly as it would live events — making replay simultaneously
-a demo tool and an integration test.
+Fetches a completed game's events from nba_api and pushes them through the
+same Redis Stream the live poller uses, so the processor consumes them
+exactly as it would live events.
 """
 
 import asyncio
-import json
 import logging
 import os
-import time
 
 import click
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from nba_api.stats.endpoints import playbyplayv2
-from nba_api.stats.static import teams
-from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
 
 load_dotenv()
 
@@ -28,10 +23,8 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 STREAM_KEY_TEMPLATE = "game_events:{game_id}"
 
-# Hardcoded recent completed games for --list-games convenience.
-# WHY hardcoded: nba_api's game finder requires a date range; hardcoding
-# 5 known good game IDs lets users demo the project immediately without
-# needing to discover IDs themselves. Update this list periodically.
+# A few known-good completed games for --list-games. nba_api's game finder
+# needs a date range, so this is just a convenience shortlist.
 SAMPLE_GAMES = [
     ("0022301214", "2024-04-14", "BOS vs MIA — Regular Season"),
     ("0022301215", "2024-04-14", "LAL vs GSW — Regular Season"),
@@ -42,13 +35,7 @@ SAMPLE_GAMES = [
 
 
 def _normalize_historical_event(game_id: str, row: dict) -> dict:
-    """
-    Convert a playbyplayv2 row dict to the canonical event schema.
-
-    WHY a separate normalizer for historical data: playbyplayv2 (stats API)
-    uses different field names than the live play-by-play endpoint. Normalizing
-    here means the processor receives the identical schema regardless of source.
-    """
+    """Convert a playbyplayv2 row into the same event schema the poller produces."""
     event_type_id = str(row.get("EVENTMSGTYPE", ""))
     # nba_api event type IDs: 1=made shot, 2=missed shot, 3=free throw,
     # 4=rebound, 5=turnover, 6=foul, 8=substitution, 12=period start, 13=end.
@@ -57,10 +44,8 @@ def _normalize_historical_event(game_id: str, row: dict) -> dict:
     if event_type_id == "1":
         event_type = "score"
     elif event_type_id == "3":
-        # WHY check description for "MISS": EVENTMSGTYPE 3 covers both made and
-        # missed free throws. nba_api marks misses with "MISS" at the start of
-        # the description string. Mapping all type-3 events to "score" would
-        # inflate home/away scores by recording possessions for missed free throws.
+        # Type 3 covers both made and missed free throws; nba_api prefixes
+        # missed ones with "MISS" in the description.
         event_type = "missed shot" if desc.upper().startswith("MISS") else "score"
     elif event_type_id == "2":
         event_type = "missed shot"
@@ -86,7 +71,7 @@ def _normalize_historical_event(game_id: str, row: dict) -> dict:
     return {
         "game_id": game_id,
         "event_type": event_type,
-        "description": str(row.get("HOMEDESCRIPTION") or row.get("VISITORDESCRIPTION") or ""),
+        "description": desc,
         "home_score": home_score,
         "away_score": away_score,
         "period": str(row.get("PERIOD", "")),
@@ -102,28 +87,12 @@ def _normalize_historical_event(game_id: str, row: dict) -> dict:
 
 
 async def _push_event(redis_client: aioredis.Redis, game_id: str, event: dict) -> None:
-    """
-    Push a single event to the Redis Stream.
-
-    WHY the SAME stream key as the live poller: replay feeds through the
-    identical pipeline. This means replay is simultaneously a demo tool and
-    an integration test — any bug in the live pipeline will also surface
-    in replay. This is the same principle as production-identical staging
-    environments: testing a different code path gives false confidence.
-    """
     stream_key = STREAM_KEY_TEMPLATE.format(game_id=game_id)
     await redis_client.xadd(stream_key, event, maxlen=10_000, approximate=True)
 
 
 async def _run_replay(game_id: str, speed: float) -> None:
-    """
-    Fetch historical play-by-play and push events at scaled real-time pace.
-
-    WHY scale by speed multiplier rather than pushing all events instantly:
-    instant push would flood the processor with a full game in seconds, making
-    it impossible to observe the incremental state changes. Scaled replay lets
-    you watch the game state evolve in a compressed but realistic way.
-    """
+    """Fetch historical play-by-play and push events paced by the real game clock."""
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
     try:
@@ -138,10 +107,6 @@ async def _run_replay(game_id: str, speed: float) -> None:
         for row in rows:
             event = _normalize_historical_event(game_id, row)
 
-            # WHY scale real-time gaps between events: nba_api provides the
-            # game clock for each event. By computing the time delta between
-            # consecutive events and dividing by speed, we reproduce realistic
-            # pacing — clutch-time possessions are slower than early-game ones.
             try:
                 period = int(row.get("PERIOD", 1))
                 parts = str(row.get("PCTIMESTRING", "12:00")).split(":")
@@ -150,18 +115,14 @@ async def _run_replay(game_id: str, speed: float) -> None:
 
                 if prev_clock_seconds is not None and prev_period == period:
                     delta = (prev_clock_seconds - clock_seconds) / speed
-                    # WHY delta > 0 guard: at period boundaries the clock resets
-                    # from 0:00 to 12:00, making delta negative. Skipping the
-                    # sleep here is correct — the period break isn't game time
-                    # and shouldn't be modeled as a real-time pause.
+                    # Clock resets to 12:00 at period boundaries, which would
+                    # otherwise produce a large negative delta.
                     if delta > 0:
                         await asyncio.sleep(delta)
 
                 prev_clock_seconds = clock_seconds
                 prev_period = period
             except (ValueError, IndexError):
-                # WHY skip sleep on parse error: a bad clock string shouldn't
-                # stall the replay; push the event immediately and continue.
                 pass
 
             await _push_event(redis_client, game_id, event)
@@ -179,14 +140,9 @@ async def _run_replay(game_id: str, speed: float) -> None:
     show_default=True,
     help="Speed multiplier (10 = 10x real time)",
 )
-@click.option("--list-games", is_flag=True, help="Print 5 recent completed games and exit")
+@click.option("--list-games", is_flag=True, help="Print sample completed games and exit")
 def main(game: str | None, speed: float, list_games: bool) -> None:
-    """
-    Replay a historical NBA game through the live processing pipeline.
-
-    WHY replay uses the live pipeline: testing a separate code path would give
-    false confidence. Replay is simultaneously a demo and an integration test.
-    """
+    """Replay a historical NBA game through the live processing pipeline."""
     if list_games:
         click.echo("\nRecent completed games available for replay:\n")
         click.echo(f"  {'Game ID':<15} {'Date':<12} Description")
