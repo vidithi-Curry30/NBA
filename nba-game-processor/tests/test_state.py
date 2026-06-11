@@ -146,7 +146,7 @@ def test_last_10_possessions_correct_outcomes():
     state.home_score = 2
     state.update({"event_type": "score", "home_score": "2", "away_score": "3",
                   "period": "1", "clock": "10:00"})
-    assert state.last_10_possessions == ["home_score", "turnover", "away_score"]
+    assert list(state.last_10_possessions) == ["home_score", "turnover", "away_score"]
 
 
 def test_last_10_possessions_rolling_window():

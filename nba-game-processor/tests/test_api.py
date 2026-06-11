@@ -112,10 +112,14 @@ def test_state_contains_all_required_fields():
 # ---------------------------------------------------------------------------
 
 def test_momentum_correct_score_for_known_possessions():
-    """momentum_score = home_scoring - away_scoring over last 10 possessions."""
+    """
+    momentum_score = home_scoring - away_scoring over last 10 possessions.
+    8 home vs 1 away (n=9): z = (8 - 4.5) / (sqrt(9)/2) = 3.5/1.5 = 2.33 > 1.5
+    -> flagged as a home run.
+    """
     possessions = [
         "home_score", "home_score", "home_score", "home_score", "home_score",
-        "away_score", "away_score", "turnover", "turnover", "turnover",
+        "home_score", "home_score", "home_score", "away_score", "turnover",
     ]
     mock_redis = _make_mock_redis(_make_state_json({"last_10_possessions": possessions}))
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
@@ -123,22 +127,28 @@ def test_momentum_correct_score_for_known_possessions():
             response = client.get("/game/0042300401/momentum")
     assert response.status_code == 200
     data = response.json()
-    assert data["momentum_score"] == 3
+    assert data["momentum_score"] == 7
+    assert data["z_score"] > 1.5
     assert "BOS" in data["interpretation"]
 
 
 def test_momentum_negative_score_when_away_on_run():
-    """momentum_score is negative when away team is on a scoring run."""
+    """
+    momentum_score is negative when away team is on a scoring run.
+    8 away vs 1 home (n=9): z = (1 - 4.5) / (sqrt(9)/2) = -3.5/1.5 = -2.33 < -1.5
+    -> flagged as an away run.
+    """
     possessions = [
         "away_score", "away_score", "away_score", "away_score", "away_score",
-        "home_score", "home_score", "turnover", "turnover", "turnover",
+        "away_score", "away_score", "away_score", "home_score", "turnover",
     ]
     mock_redis = _make_mock_redis(_make_state_json({"last_10_possessions": possessions}))
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
             response = client.get("/game/0042300401/momentum")
     data = response.json()
-    assert data["momentum_score"] == -3
+    assert data["momentum_score"] == -7
+    assert data["z_score"] < -1.5
     assert "DAL" in data["interpretation"]
 
 
@@ -149,6 +159,36 @@ def test_momentum_returns_404_when_game_missing():
         with TestClient(app) as client:
             response = client.get("/game/9999999999/momentum")
     assert response.status_code == 404
+
+
+def test_momentum_contested_within_z_threshold():
+    """
+    A 5-4 split (n=9): z = (5 - 4.5) / (sqrt(9)/2) = 0.5/1.5 = 0.33,
+    well within +-1.5 -> "Contested".
+    """
+    possessions = [
+        "home_score", "away_score", "home_score", "away_score", "home_score",
+        "away_score", "home_score", "away_score", "home_score", "turnover",
+    ]
+    mock_redis = _make_mock_redis(_make_state_json({"last_10_possessions": possessions}))
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/momentum")
+    data = response.json()
+    assert abs(data["z_score"]) < 1.5
+    assert data["interpretation"] == "Contested"
+
+
+def test_momentum_zero_scoring_possessions_is_neutral():
+    """If the last 10 possessions are all turnovers, z_score is 0 (no evidence)."""
+    possessions = ["turnover"] * 10
+    mock_redis = _make_mock_redis(_make_state_json({"last_10_possessions": possessions}))
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/momentum")
+    data = response.json()
+    assert data["z_score"] == 0.0
+    assert data["interpretation"] == "Contested"
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +267,46 @@ def test_efficiency_returns_404_when_game_missing():
     with patch("src.api.aioredis.from_url", return_value=mock_redis):
         with TestClient(app) as client:
             response = client.get("/game/9999999999/efficiency")
+    assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /win-probability
+# ---------------------------------------------------------------------------
+
+def test_win_probability_returns_200_and_valid_shape():
+    mock_redis = _make_mock_redis(_make_state_json())
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/win-probability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["home_team"] == "BOS"
+    assert data["away_team"] == "DAL"
+    assert 0.0 <= data["home_win_probability"] <= 1.0
+    assert abs(data["home_win_probability"] + data["away_win_probability"] - 1.0) < 1e-6
+    assert data["is_final"] is False
+
+
+def test_win_probability_final_game_is_deterministic():
+    state_json = _make_state_json({
+        "home_score": 110, "away_score": 100, "game_status": "final",
+    })
+    mock_redis = _make_mock_redis(state_json)
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/0042300401/win-probability")
+    data = response.json()
+    assert data["home_win_probability"] == 1.0
+    assert data["away_win_probability"] == 0.0
+    assert data["is_final"] is True
+
+
+def test_win_probability_returns_404_when_game_missing():
+    mock_redis = _make_mock_redis(None)
+    with patch("src.api.aioredis.from_url", return_value=mock_redis):
+        with TestClient(app) as client:
+            response = client.get("/game/9999999999/win-probability")
     assert response.status_code == 404
 
 

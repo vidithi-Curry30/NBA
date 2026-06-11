@@ -40,6 +40,15 @@ STATE_TTL_SECONDS = 4 * 60 * 60
 # idle — no busy-waiting, but fast enough to be effectively real-time.
 XREADGROUP_BLOCK_MS = 1000
 
+# WHY an artificial per-message delay hook (default 0, off in production):
+# real processing of a single event takes microseconds, which makes it
+# impossible to kill -9 the processor "mid-stream" for a crash-recovery demo —
+# by the time you send the signal, every message is already acked. Setting
+# PROCESSOR_DEMO_DELAY_MS slows down processing enough to reliably observe a
+# message in the pending entries list (XPENDING) before a restart. Zero
+# overhead and zero behavior change when unset.
+PROCESSOR_DEMO_DELAY_MS = int(os.getenv("PROCESSOR_DEMO_DELAY_MS", "0"))
+
 
 async def _ensure_consumer_group(
     redis_client: aioredis.Redis, stream_key: str
@@ -87,6 +96,60 @@ async def _write_state_snapshot(
         await pipe.execute()
 
 
+async def _load_state_snapshot(
+    redis_client: aioredis.Redis, game_id: str
+) -> GameState | None:
+    """
+    Load a previously written state snapshot, if one exists.
+
+    WHY this is required for crash recovery: messages already XACKed before a
+    crash are gone from the pending entries list (PEL) by design — re-reading
+    them would double-count possessions and scores. Rehydrating from the last
+    materialized snapshot picks up exactly where the previous run left off;
+    only messages still in the PEL (delivered but unacked) get reprocessed
+    on top of it.
+    """
+    state_key = STATE_KEY_TEMPLATE.format(game_id=game_id)
+    raw = await redis_client.hget(state_key, "data")
+    if raw is None:
+        return None
+    return GameState.model_validate_json(raw)
+
+
+async def _drain_pending_messages(
+    redis_client: aioredis.Redis, stream_key: str, state: GameState
+) -> GameState:
+    """
+    Reprocess any messages left in this consumer's pending entries list (PEL).
+
+    WHY id="0" instead of ">": ">" means "messages never delivered to any
+    consumer in this group" — it does NOT redeliver a message already
+    delivered to (and still pending for) this same consumer. After a crash,
+    those messages are exactly what XPENDING shows as outstanding for
+    "processor-1". Reading with id="0" asks Redis for this consumer's own
+    PEL, oldest first, so they're applied (and finally acked) before any new
+    events are consumed.
+    """
+    while True:
+        results = await redis_client.xreadgroup(
+            groupname=CONSUMER_GROUP,
+            consumername=CONSUMER_NAME,
+            streams={stream_key: "0"},
+            count=10,
+        )
+        messages = results[0][1] if results else []
+        if not messages:
+            return state
+
+        for message_id, fields in messages:
+            state = await _process_message(
+                redis_client, stream_key, message_id, fields, state
+            )
+
+        if state.game_status == "final":
+            return state
+
+
 async def _process_message(
     redis_client: aioredis.Redis,
     stream_key: str,
@@ -102,6 +165,9 @@ async def _process_message(
     message on restart. Processing an event twice is safe (score won't change
     if the delta is 0); dropping an event silently would corrupt state.
     """
+    if PROCESSOR_DEMO_DELAY_MS:
+        await asyncio.sleep(PROCESSOR_DEMO_DELAY_MS / 1000.0)
+
     state.update(fields)
     await _write_state_snapshot(redis_client, state)
 
@@ -118,24 +184,32 @@ async def process_game(game_id: str) -> None:
     Main consumer loop: read events from stream and maintain game state.
 
     WHY consumer groups instead of basic XREAD: consumer groups persist the
-    last-acknowledged offset per consumer. On restart, XREADGROUP delivers
-    unacknowledged messages first (the PEL — pending entry list), then new
-    ones. Basic XREAD would require storing the offset externally or risk
-    reprocessing the entire stream from the beginning.
+    last-acknowledged offset per consumer. On restart, draining this
+    consumer's PEL with id="0" (see _drain_pending_messages) replays any
+    messages that were delivered but never acked before a crash, then ">"
+    resumes consuming new messages. Basic XREAD would require storing the
+    offset externally or risk reprocessing the entire stream from the
+    beginning.
     """
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     stream_key = STREAM_KEY_TEMPLATE.format(game_id=game_id)
 
     await _ensure_consumer_group(redis_client, stream_key)
 
-    # WHY initialize GameState with game_id here: the model needs a game_id
-    # to construct the correct Redis Hash key for writes. Other fields default
-    # to zero/empty and are updated by the first event.
-    state = GameState(game_id=game_id)
+    # WHY rehydrate from the last snapshot instead of always starting fresh:
+    # on a clean first run there's nothing to load and we start from a zero
+    # GameState as before. On restart after a crash, this restores the state
+    # as of the last successful ack so that replaying PEL messages doesn't
+    # double-count already-acked possessions.
+    state = await _load_state_snapshot(redis_client, game_id)
+    if state is None:
+        state = GameState(game_id=game_id)
     logger.info("Processor started for game %s", game_id)
 
+    state = await _drain_pending_messages(redis_client, stream_key, state)
+
     try:
-        while True:
+        while state.game_status != "final":
             # WHY ">" as the start ID: in consumer groups, ">" means "give me
             # messages not yet delivered to any consumer". Previously unacked
             # messages are delivered automatically before new ones.
