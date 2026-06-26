@@ -11,3 +11,4 @@ httpx==0.28.0
 pandas==2.2.3
 scikit-learn==1.5.2
 joblib==1.4.2
+rich==13.9.4

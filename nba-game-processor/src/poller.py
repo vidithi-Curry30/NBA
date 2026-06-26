@@ -44,6 +44,8 @@ def _build_event(game_id: str, play: dict, home_team: str, away_team: str) -> di
         event_type = "period start"
     elif action_type == "turnover":
         event_type = "turnover"
+    elif action_type == "foul":
+        event_type = "foul"
     elif action_type == "game":
         event_type = "end of game"
     else:
