@@ -330,3 +330,47 @@ def test_substitution_unknown_team_is_noop():
         "clock": "6:00",
     })
     assert state.home_players_on_court == ["p1", "p2", "p3", "p4", "p5"]
+
+
+# ---------------------------------------------------------------------------
+# Foul tracking tests
+# ---------------------------------------------------------------------------
+
+def test_foul_increments_player_count():
+    state = make_base_state()
+    for _ in range(3):
+        state.update({"event_type": "foul", "player": "Tatum", "period": "2", "clock": "8:00"})
+    assert state.player_fouls["Tatum"] == 3
+
+
+def test_foul_trouble_before_q4():
+    """4 fouls before Q4 = foul trouble."""
+    state = make_base_state()
+    state.period = 3
+    state.player_fouls["Tatum"] = 4
+    trouble = state.foul_trouble_players()
+    assert "Tatum" in trouble
+
+
+def test_no_foul_trouble_in_q4_at_four():
+    """4 fouls in Q4 is not trouble — only 5+ triggers it."""
+    state = make_base_state()
+    state.period = 4
+    state.player_fouls["Tatum"] = 4
+    trouble = state.foul_trouble_players()
+    assert "Tatum" not in trouble
+
+
+def test_fouled_out_at_six():
+    state = make_base_state()
+    state.period = 4
+    state.player_fouls["Tatum"] = 6
+    trouble = state.foul_trouble_players()
+    assert "Tatum" in trouble
+
+
+def test_foul_event_ignored_without_player():
+    """Foul events with no player name don't crash or add empty key."""
+    state = make_base_state()
+    state.update({"event_type": "foul", "player": "", "period": "1", "clock": "10:00"})
+    assert state.player_fouls == {}

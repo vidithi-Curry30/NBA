@@ -116,6 +116,16 @@ class WinProbabilityResponse(BaseModel):
     is_final: bool
 
 
+class FoulTroubleResponse(BaseModel):
+    game_id: str
+    home_team: str
+    away_team: str
+    home_foul_trouble: dict[str, int]
+    away_foul_trouble: dict[str, int]
+    all_player_fouls: dict[str, int]
+    period: int
+
+
 class StreamEvent(BaseModel):
     """One entry from the Redis Stream — the raw event as pushed by the poller."""
     stream_id: str
@@ -236,6 +246,32 @@ async def get_win_probability(game_id: str) -> WinProbabilityResponse:
         home_win_probability=round(home_prob, 4),
         away_win_probability=round(1.0 - home_prob, 4),
         is_final=state.game_status == "final",
+    )
+
+
+@app.get("/game/{game_id}/foul-trouble", response_model=FoulTroubleResponse)
+async def get_foul_trouble(game_id: str) -> FoulTroubleResponse:
+    """
+    Players currently in foul trouble: 4+ fouls before Q4, or 5+ in Q4.
+
+    Foul trouble is a hidden game-state variable the score alone misses —
+    a team's star picking up a 4th foul in Q2 changes their win probability
+    more than most 3-point swings.
+    """
+    state = await _get_state_from_redis(game_id)
+    trouble = state.foul_trouble_players()
+
+    home_trouble = {p: f for p, f in trouble.items() if p in state.home_players_on_court}
+    away_trouble = {p: f for p, f in trouble.items() if p in state.away_players_on_court}
+
+    return FoulTroubleResponse(
+        game_id=game_id,
+        home_team=state.home_team,
+        away_team=state.away_team,
+        home_foul_trouble=home_trouble,
+        away_foul_trouble=away_trouble,
+        all_player_fouls=state.player_fouls,
+        period=state.period,
     )
 
 

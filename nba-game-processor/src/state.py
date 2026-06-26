@@ -47,6 +47,12 @@ class GameState(BaseModel):
     home_players_on_court: list[str] = Field(default_factory=list)
     away_players_on_court: list[str] = Field(default_factory=list)
 
+    # Foul counts per player name. Players with 4+ fouls in the first three
+    # quarters are in "foul trouble" — they play reduced minutes and teams
+    # often pull them to avoid fouling out. This materially affects win
+    # probability in ways the score-diff model can't see.
+    player_fouls: dict[str, int] = Field(default_factory=dict)
+
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
     @property
@@ -144,6 +150,30 @@ class GameState(BaseModel):
                 pass
         self.clock = "5:00" if self.period > 4 else "12:00"
 
+    def _handle_foul(self, event: dict) -> None:
+        player = str(event.get("player", "")).strip()
+        if not player:
+            return
+        self.player_fouls[player] = self.player_fouls.get(player, 0) + 1
+
+    def foul_trouble_players(self) -> dict[str, int]:
+        """
+        Returns players currently in foul trouble.
+
+        The NBA threshold: 4+ fouls before the 4th quarter, or 5+ fouls at
+        any point (6 fouls = fouled out). This is the thing TV analysts talk
+        about that the score alone doesn't capture.
+        """
+        trouble: dict[str, int] = {}
+        for player, fouls in self.player_fouls.items():
+            if fouls >= 6:
+                trouble[player] = fouls  # fouled out
+            elif fouls >= 4 and self.period < 4:
+                trouble[player] = fouls  # in trouble before 4th
+            elif fouls >= 5 and self.period == 4:
+                trouble[player] = fouls  # one foul from out in 4th
+        return trouble
+
     def _handle_turnover(self, event: dict) -> None:
         # Turnovers count as possessions for pace even though no points
         # are scored.
@@ -181,6 +211,8 @@ class GameState(BaseModel):
             self._handle_period_change(event)
         elif event_type == "turnover":
             self._handle_turnover(event)
+        elif event_type in ("foul", "personal foul", "technical foul"):
+            self._handle_foul(event)
         elif event_type in ("end of game", "final"):
             self._handle_end_of_game()
         else:

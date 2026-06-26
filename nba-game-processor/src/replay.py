@@ -51,6 +51,8 @@ def _normalize_historical_event(game_id: str, row: dict) -> dict:
         event_type = "missed shot"
     elif event_type_id == "5":
         event_type = "turnover"
+    elif event_type_id == "6":
+        event_type = "foul"
     elif event_type_id == "8":
         event_type = "substitution"
     elif event_type_id == "12":
