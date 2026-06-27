@@ -12,13 +12,23 @@ import os
 
 import click
 import redis.asyncio as aioredis
+import requests
 from dotenv import load_dotenv
-from nba_api.stats.endpoints import playbyplayv2
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+# The CDN endpoint doesn't require authentication or special headers and isn't
+# rate-limited the way stats.nba.com is. It serves the same live play-by-play
+# data but is cached at the edge, so it works reliably from home networks.
+CDN_URL = "https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
+CDN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+}
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 STREAM_KEY_TEMPLATE = "game_events:{game_id}"
@@ -34,57 +44,61 @@ SAMPLE_GAMES = [
 ]
 
 
-def _normalize_historical_event(game_id: str, row: dict) -> dict:
-    """Convert a playbyplayv2 row into the same event schema the poller produces."""
-    event_type_id = str(row.get("EVENTMSGTYPE", ""))
-    # nba_api event type IDs: 1=made shot, 2=missed shot, 3=free throw,
-    # 4=rebound, 5=turnover, 6=foul, 8=substitution, 12=period start, 13=end.
-    desc = str(row.get("HOMEDESCRIPTION") or row.get("VISITORDESCRIPTION") or "")
+def _fetch_play_by_play(game_id: str) -> tuple[list[dict], str, str]:
+    """
+    Fetch play-by-play from the NBA CDN. Returns (actions, home_team, away_team).
 
-    if event_type_id == "1":
-        event_type = "score"
-    elif event_type_id == "3":
-        # Type 3 covers both made and missed free throws; nba_api prefixes
-        # missed ones with "MISS" in the description.
-        event_type = "missed shot" if desc.upper().startswith("MISS") else "score"
-    elif event_type_id == "2":
-        event_type = "missed shot"
-    elif event_type_id == "5":
-        event_type = "turnover"
-    elif event_type_id == "6":
-        event_type = "foul"
-    elif event_type_id == "8":
+    The CDN uses the same live-data format as the live poller, so we reuse
+    the same field names. This endpoint is publicly accessible without auth
+    and doesn't rate-limit home IP addresses the way stats.nba.com does.
+    """
+    url = CDN_URL.format(game_id=game_id)
+    resp = requests.get(url, headers=CDN_HEADERS, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    game = data["game"]
+    home_team = game.get("homeTeam", {}).get("teamTricode", "")
+    away_team = game.get("awayTeam", {}).get("teamTricode", "")
+    actions = game.get("actions", [])
+    return actions, home_team, away_team
+
+
+def _normalize_cdn_event(game_id: str, play: dict, home_team: str, away_team: str) -> dict:
+    """Convert a CDN action dict into the same schema the live poller produces."""
+    action_type = str(play.get("actionType", "")).lower()
+
+    if action_type in ("2pt", "3pt", "freethrow"):
+        event_type = "score" if play.get("shotResult", "").lower() == "made" else "missed shot"
+    elif action_type == "substitution":
         event_type = "substitution"
-    elif event_type_id == "12":
+    elif action_type == "period":
         event_type = "period start"
-    elif event_type_id == "13":
+    elif action_type == "turnover":
+        event_type = "turnover"
+    elif action_type == "foul":
+        event_type = "foul"
+    elif action_type == "game":
         event_type = "end of game"
     else:
-        event_type = "other"
+        event_type = action_type
 
-    raw_clock = str(row.get("PCTIMESTRING", "12:00"))
-    home_score_str = str(row.get("SCORE", "") or "")
-    home_score, away_score = "", ""
-    if "  -  " in home_score_str or " - " in home_score_str:
-        parts = home_score_str.replace("  -  ", " - ").split(" - ")
-        if len(parts) == 2:
-            away_score, home_score = parts[0].strip(), parts[1].strip()
+    sub_type = str(play.get("subType", "")).lower() if action_type == "substitution" else ""
+    raw_clock = str(play.get("clock", "PT12M00S")).replace("PT", "").replace("M", ":").rstrip("S")
 
     return {
         "game_id": game_id,
         "event_type": event_type,
-        "description": desc,
-        "home_score": home_score,
-        "away_score": away_score,
-        "period": str(row.get("PERIOD", "")),
+        "description": str(play.get("description", "")),
+        "home_score": str(play.get("scoreHome", "")),
+        "away_score": str(play.get("scoreAway", "")),
+        "period": str(play.get("period", "")),
         "clock": raw_clock,
-        "player": str(row.get("PLAYER1_NAME", "")),
-        "player_in": str(row.get("PLAYER2_NAME", "")),
-        "player_out": str(row.get("PLAYER1_NAME", "")),
-        "team": str(row.get("PLAYER1_TEAM_ABBREVIATION", "")),
-        "home_team": "",
-        "away_team": "",
-        "action_number": str(row.get("EVENTNUM", "")),
+        "player": str(play.get("playerNameI", "")),
+        "sub_type": sub_type,
+        "team": str(play.get("teamTricode", "")),
+        "home_team": home_team,
+        "away_team": away_team,
+        "action_number": str(play.get("actionNumber", "")),
     }
 
 
@@ -98,27 +112,28 @@ async def _run_replay(game_id: str, speed: float) -> None:
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
     try:
-        logger.info("Fetching play-by-play for game %s from nba_api...", game_id)
-        pbp = playbyplayv2.PlayByPlayV2(game_id=game_id)
-        rows = pbp.get_data_frames()[0].to_dict(orient="records")
-        logger.info("Fetched %d events.", len(rows))
+        logger.info("Fetching play-by-play for game %s from NBA CDN...", game_id)
+        actions, home_team, away_team = _fetch_play_by_play(game_id)
+        logger.info("Fetched %d events. %s (home) vs %s (away)", len(actions), home_team, away_team)
 
         prev_clock_seconds: float | None = None
         prev_period: int | None = None
 
-        for row in rows:
-            event = _normalize_historical_event(game_id, row)
+        for play in actions:
+            event = _normalize_cdn_event(game_id, play, home_team, away_team)
 
             try:
-                period = int(row.get("PERIOD", 1))
-                parts = str(row.get("PCTIMESTRING", "12:00")).split(":")
-                mins, secs = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+                period = int(play.get("period", 1))
+                raw_clock = str(play.get("clock", "PT12M00S"))
+                clock_str = raw_clock.replace("PT", "").replace("M", ":").rstrip("S")
+                parts = clock_str.split(":")
+                mins = int(parts[0])
+                secs = int(float(parts[1])) if len(parts) > 1 else 0
                 clock_seconds = mins * 60 + secs
 
                 if prev_clock_seconds is not None and prev_period == period:
                     delta = (prev_clock_seconds - clock_seconds) / speed
-                    # Clock resets to 12:00 at period boundaries, which would
-                    # otherwise produce a large negative delta.
+                    # Clock resets at period boundaries — skip negative deltas.
                     if delta > 0:
                         await asyncio.sleep(delta)
 
