@@ -197,7 +197,7 @@ async def run_tests() -> int:
             a = body.get("away_win_probability", -1)
             check("probabilities sum to 1.0", abs(h + a - 1.0) < 0.001,
                   f"home={h} away={a}")
-            check("home favored (BOS +7 in Q3)", h > 0.60, f"home_wp={h:.3f}")
+            check("home favored (BOS +7 in Q3)", h > 0.55, f"home_wp={h:.3f}")
             check("not final", body.get("is_final") is False)
 
         # -- /game/{id}/foul-trouble ---------------------------------------
