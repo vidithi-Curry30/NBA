@@ -23,8 +23,9 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    env_file:
-      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NBA_API_DELAY=3
     volumes:
       - ./src:/app/src
 
