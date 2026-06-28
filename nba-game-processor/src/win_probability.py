@@ -2,6 +2,7 @@
 Win probability inference: load the trained XGBoost model and score a GameState.
 
 Feature construction must stay in sync with scripts/train_win_probability.py.
+12 features, up from the original 3 (logistic regression baseline).
 """
 
 import math
@@ -17,22 +18,23 @@ _feature_names = _artifact["feature_names"]
 GAME_MINUTES = 48.0
 
 
-def _minutes_to_period(minutes_remaining: float) -> int:
-    elapsed = GAME_MINUTES - minutes_remaining
-    if elapsed <= 0:
-        return 1
-    return min(int(elapsed / 12) + 1, 4)
-
-
 def build_features(score_diff: int, minutes_remaining: float) -> list[float]:
     """Must match build_features() in train_win_probability.py exactly."""
     minutes_remaining = max(minutes_remaining, 0.0)
-    interaction = score_diff / math.sqrt(minutes_remaining + 1.0)
-    period = _minutes_to_period(minutes_remaining)
+    elapsed = GAME_MINUTES - minutes_remaining
+    period = min(int(elapsed / 12) + 1, 4) if elapsed > 0 else 1
     is_clutch = 1.0 if (minutes_remaining <= 5.0 and abs(score_diff) <= 5) else 0.0
+    is_late_clutch = 1.0 if (minutes_remaining <= 2.0 and abs(score_diff) <= 3) else 0.0
+    interaction = score_diff / math.sqrt(minutes_remaining + 1.0)
     abs_diff = abs(score_diff)
     score_diff_sq = score_diff ** 2
-    return [score_diff, minutes_remaining, interaction, period, is_clutch, abs_diff, score_diff_sq]
+    time_pressure = 1.0 / (minutes_remaining + 0.5)
+    lead_security = score_diff * time_pressure
+    large_lead = 1.0 if abs_diff >= 15 else 0.0
+    game_frac = elapsed / GAME_MINUTES
+    return [score_diff, minutes_remaining, interaction, period, is_clutch,
+            is_late_clutch, abs_diff, score_diff_sq, time_pressure,
+            lead_security, large_lead, game_frac]
 
 
 def predict_win_probability(state: "GameState") -> float:
