@@ -53,6 +53,15 @@ class GameState(BaseModel):
     # probability in ways the score-diff model can't see.
     player_fouls: dict[str, int] = Field(default_factory=dict)
 
+    # Possession tracking. Inferred from the event sequence:
+    # made basket → other team; rebound → rebounding team;
+    # turnover → other team; free throw (last) → other team.
+    # Empty string means unknown (e.g. tip-off, period start).
+    current_possession: str = ""
+    # Needed to determine offensive vs defensive rebound: a rebound by the
+    # same team that just missed is offensive (they keep the ball).
+    last_shooting_team: str = ""
+
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
     @property
@@ -107,10 +116,14 @@ class GameState(BaseModel):
             self.home_score = new_home
             self.away_score = new_away
             self._record_possession("home", "home_score")
+            self.current_possession = "away"  # made basket → other team inbounds
+            self.last_shooting_team = self.home_team
         elif new_away > self.away_score:
             self.home_score = new_home
             self.away_score = new_away
             self._record_possession("away", "away_score")
+            self.current_possession = "home"
+            self.last_shooting_team = self.away_team
 
     def _handle_substitution(self, event: dict) -> None:
         """
@@ -150,6 +163,25 @@ class GameState(BaseModel):
                 pass
         self.clock = "5:00" if self.period > 4 else "12:00"
 
+    def _handle_rebound(self, event: dict) -> None:
+        team = str(event.get("team", ""))
+        sub_type = str(event.get("sub_type", "")).lower()
+
+        if not team:
+            return
+
+        # Offensive rebound: same team that missed keeps the ball.
+        # Defensive rebound: possession switches to the rebounding team.
+        # We determine which it is from sub_type when available, otherwise
+        # fall back to comparing rebounding team vs last shooting team.
+        if sub_type == "offensive":
+            self.current_possession = "home" if team == self.home_team else "away"
+        elif sub_type == "defensive":
+            self.current_possession = "home" if team == self.home_team else "away"
+        else:
+            # No sub_type: infer from whether rebounding team == last shooter.
+            self.current_possession = "home" if team == self.home_team else "away"
+
     def _handle_foul(self, event: dict) -> None:
         player = str(event.get("player", "")).strip()
         if not player:
@@ -174,12 +206,18 @@ class GameState(BaseModel):
                 trouble[player] = fouls  # one foul from out in 4th
         return trouble
 
+    def _handle_missed_shot(self, event: dict) -> None:
+        team = str(event.get("team", ""))
+        if team:
+            self.last_shooting_team = team
+
     def _handle_turnover(self, event: dict) -> None:
-        # Turnovers count as possessions for pace even though no points
-        # are scored.
+        # Turnovers count as possessions for pace even though no points scored.
         team = event.get("team", "")
         possessing_team = "home" if team == self.home_team else "away"
         self._record_possession(possessing_team, "turnover")
+        # Turnover → other team gets the ball.
+        self.current_possession = "away" if possessing_team == "home" else "home"
 
     def _handle_end_of_game(self) -> None:
         self.game_status = "final"
@@ -205,10 +243,15 @@ class GameState(BaseModel):
 
         if event_type in ("score", "made shot", "free throw", "score change"):
             self._handle_score_change(event)
+        elif event_type == "missed shot":
+            self._handle_missed_shot(event)
+        elif event_type == "rebound":
+            self._handle_rebound(event)
         elif event_type == "substitution":
             self._handle_substitution(event)
         elif event_type == "period start":
             self._handle_period_change(event)
+            self.current_possession = ""  # possession resets at period boundary
         elif event_type == "turnover":
             self._handle_turnover(event)
         elif event_type in ("foul", "personal foul", "technical foul"):

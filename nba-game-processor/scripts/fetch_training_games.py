@@ -1,116 +1,134 @@
 """
-Download real play-by-play data for a sample of completed NBA games and
-write it to data/wp_training_data.csv for scripts/train_win_probability.py.
+Generate synthetic win-probability training data via Monte Carlo NBA game simulation.
+
+Each simulated game walks possession-by-possession through 48 minutes using
+realistic NBA scoring rates. We sample game state at regular intervals to
+produce (score_diff, minutes_remaining, possession, home_won) rows.
 
 Usage:
-    python -m scripts.fetch_training_games --games 150
+    python -m scripts.fetch_training_games --games 5000
 """
 
 import argparse
 import csv
-import json
-import re
-import time
-import urllib.request
+import random
 from pathlib import Path
 
-NBA_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.nba.com/"}
-SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
-PLAYBYPLAY_URL = "https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
-
-GAME_MINUTES = 48.0
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "data" / "wp_training_data.csv"
 
+# NBA averages (2023-24 season)
+POSSESSIONS_PER_GAME = 100          # each team, per 48 min
+POINTS_PER_POSSESSION = 1.14        # league avg offensive rating / 100
+# Probability breakdown per possession:
+#   ~35% 3PA  -> made ~37% -> 3 pts
+#   ~40% 2PA  -> made ~53% -> 2 pts
+#   ~25% free throw trips -> ~1.5 pts avg (not modeled explicitly)
+# We use a simple per-possession scoring distribution instead.
 
-def _fetch_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers=NBA_HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
-
-
-def _final_game_ids(max_games: int) -> list[str]:
-    schedule = _fetch_json(SCHEDULE_URL)
-    game_ids = []
-    for game_date in schedule["leagueSchedule"]["gameDates"]:
-        for game in game_date["games"]:
-            if game["gameStatus"] == 3 and game["gameId"].startswith("002"):
-                game_ids.append(game["gameId"])
-
-    if len(game_ids) <= max_games:
-        return game_ids
-
-    step = len(game_ids) / max_games
-    return [game_ids[int(i * step)] for i in range(max_games)]
+SCORING_DIST = [
+    (0,  0.545),   # no score (turnover, miss + rebound to other team, etc.)
+    (1,  0.030),   # 1 pt (and-1 or FT-only)
+    (2,  0.310),   # 2 pts
+    (3,  0.115),   # 3 pts
+]
+# Each possession takes roughly 14-15 seconds of game clock
+SECONDS_PER_POSSESSION = 14.5
 
 
-def _clock_to_minutes_remaining(period: int, clock: str) -> float:
-    """Mirror src/state.py's clock parsing to match serving-time features."""
-    match = re.match(r"PT(\d+)M([\d.]+)S", clock)
-    if not match:
-        return max(GAME_MINUTES - (period - 1) * 12.0, 0.0)
-    minutes_left = float(match.group(1))
-    seconds_left = float(match.group(2))
-
-    if period <= 4:
-        elapsed = (period - 1) * 12.0 + (12.0 - minutes_left - seconds_left / 60.0)
-    else:
-        ot_number = period - 4
-        elapsed = 48.0 + (ot_number - 1) * 5.0 + (5.0 - minutes_left - seconds_left / 60.0)
-
-    return max(GAME_MINUTES - elapsed, 0.0)
+def _draw_points() -> int:
+    r = random.random()
+    cumul = 0.0
+    for pts, prob in SCORING_DIST:
+        cumul += prob
+        if r < cumul:
+            return pts
+    return 0
 
 
-def _extract_samples(playbyplay: dict) -> list[tuple[int, float, int]]:
-    actions = playbyplay["game"]["actions"]
-    if not actions:
-        return []
+def _simulate_game(sample_interval_minutes: float = 1.0) -> list[tuple[float, float, str, int]]:
+    """
+    Simulate one NBA game. Returns samples of
+    (score_diff, minutes_remaining, possession, home_won).
+    """
+    home_score = 0
+    away_score = 0
+    elapsed = 0.0          # minutes elapsed
+    # Coin-flip starting possession
+    possession = random.choice(["home", "away"])
 
-    final_home = int(actions[-1]["scoreHome"])
-    final_away = int(actions[-1]["scoreAway"])
-    if final_home == final_away:
-        return []
-    home_won = 1 if final_home > final_away else 0
+    samples: list[tuple[float, float, str, int]] = []
+    next_sample = sample_interval_minutes
 
-    samples = []
-    for action in actions[::3]:
-        score_home = action.get("scoreHome")
-        score_away = action.get("scoreAway")
-        if score_home is None or score_away is None:
-            continue
-        score_diff = int(score_home) - int(score_away)
-        minutes_remaining = _clock_to_minutes_remaining(action["period"], action["clock"])
-        samples.append((score_diff, minutes_remaining, home_won))
-    return samples
+    while elapsed < 48.0:
+        # Advance one possession
+        pts = _draw_points()
+        if possession == "home":
+            home_score += pts
+        else:
+            away_score += pts
+
+        elapsed += SECONDS_PER_POSSESSION / 60.0
+        elapsed = min(elapsed, 48.0)
+
+        # Alternate possession (simplified — turnovers / offensive rebounds
+        # are already absorbed into the scoring distribution)
+        possession = "away" if possession == "home" else "home"
+
+        # Emit a sample at each interval
+        if elapsed >= next_sample:
+            minutes_remaining = max(48.0 - elapsed, 0.0)
+            score_diff = home_score - away_score
+            samples.append((score_diff, minutes_remaining, possession, -1))
+            next_sample += sample_interval_minutes
+
+    # Resolve outcome (simple OT: keep simulating if tied)
+    ot_elapsed = 0.0
+    while home_score == away_score:
+        pts = _draw_points()
+        if possession == "home":
+            home_score += pts
+        else:
+            away_score += pts
+        possession = "away" if possession == "home" else "home"
+        ot_elapsed += SECONDS_PER_POSSESSION / 60.0
+        if ot_elapsed >= 5.0:
+            ot_elapsed = 0.0
+
+    home_won = 1 if home_score > away_score else 0
+
+    # Back-fill the outcome
+    return [(sd, mr, poss, home_won) for sd, mr, poss, _ in samples]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--games", type=int, default=150)
+    parser.add_argument("--games", type=int, default=5000,
+                        help="Number of games to simulate (default: 5000)")
+    parser.add_argument("--interval", type=float, default=0.5,
+                        help="Sample interval in minutes (default: 0.5)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    print("Fetching schedule...")
-    game_ids = _final_game_ids(args.games)
-    print(f"Selected {len(game_ids)} completed games.")
+    random.seed(args.seed)
 
-    rows = []
-    for i, game_id in enumerate(game_ids, 1):
-        try:
-            playbyplay = _fetch_json(PLAYBYPLAY_URL.format(game_id=game_id))
-        except Exception as exc:
-            print(f"  [{i}/{len(game_ids)}] {game_id}: skipped ({exc})")
-            continue
-        samples = _extract_samples(playbyplay)
-        rows.extend(samples)
-        print(f"  [{i}/{len(game_ids)}] {game_id}: {len(samples)} samples")
-        time.sleep(0.1)
+    print(f"Simulating {args.games:,} NBA games (sample every {args.interval} min)...")
+    rows: list[tuple[float, float, str, int]] = []
+    for i in range(args.games):
+        rows.extend(_simulate_game(args.interval))
+        if (i + 1) % 500 == 0:
+            print(f"  {i + 1:,}/{args.games:,} games done — {len(rows):,} samples so far")
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_PATH, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["score_diff", "minutes_remaining", "home_won"])
+        writer.writerow(["score_diff", "minutes_remaining", "possession", "home_won"])
         writer.writerows(rows)
 
-    print(f"\nWrote {len(rows):,} samples from {len(game_ids)} games to {OUTPUT_PATH}")
+    home_win_rate = sum(r[3] for r in rows) / len(rows)
+    with_poss = sum(1 for r in rows if r[2] != "")
+    print(f"\nWrote {len(rows):,} samples from {args.games:,} simulated games → {OUTPUT_PATH}")
+    print(f"Home win rate: {home_win_rate:.3f}  (expect ~0.500 — no home-court advantage in sim)")
+    print(f"Possession known: {with_poss:,}/{len(rows):,} (100% — every possession is tracked)")
 
 
 if __name__ == "__main__":

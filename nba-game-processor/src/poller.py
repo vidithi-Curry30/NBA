@@ -44,6 +44,8 @@ def _build_event(game_id: str, play: dict, home_team: str, away_team: str) -> di
         event_type = "period start"
     elif action_type == "turnover":
         event_type = "turnover"
+    elif action_type == "rebound":
+        event_type = "rebound"
     elif action_type == "foul":
         event_type = "foul"
     elif action_type == "game":
@@ -51,10 +53,8 @@ def _build_event(game_id: str, play: dict, home_team: str, away_team: str) -> di
     else:
         event_type = action_type
 
-    # The live API emits substitutions as two events per swap, one with
-    # subType="out" and one with subType="in" — state.py uses this to
-    # update the on-court roster.
-    sub_type = str(play.get("subType", "")).lower() if action_type == "substitution" else ""
+    # subType is used for substitutions (in/out) and rebounds (offensive/defensive).
+    sub_type = str(play.get("subType", "")).lower() if action_type in ("substitution", "rebound") else ""
 
     return {
         "game_id": game_id,

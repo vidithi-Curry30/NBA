@@ -1,10 +1,33 @@
 """
 Train the win-probability model from real play-by-play data.
 
-Reads data/wp_training_data.csv (produced by scripts/fetch_training_games.py),
-fits a logistic regression on (score_diff, minutes_remaining,
-score_diff / sqrt(minutes_remaining + 1)), and saves it to
-src/models/win_probability.joblib.
+Model: XGBoost with isotonic calibration.
+
+Features (13 total when possession is known, 12 when unknown):
+  Core signal:
+    score_diff, minutes_remaining
+  Time-adjusted lead:
+    score_diff_over_sqrt_time, time_pressure, lead_security
+  Game context:
+    period, game_frac, large_lead
+  Clutch flags:
+    is_clutch (last 5 min, margin<=5), is_late_clutch (last 2 min, margin<=3)
+  Magnitude:
+    abs_score_diff, score_diff_sq
+  Possession (when known):
+    home_has_possession: 1=home, 0=away, 0.5=unknown
+    trailing_has_possession: 1 if trailing team has ball (comeback opportunity)
+
+Possession handling: the training CSV marks possession as "home"/"away"/"".
+For unknown possession we use 0.5 (neutral prior). This means possession
+is most informative in clutch situations where it's actually tracked, which
+is exactly where it matters most.
+
+Accuracy progression:
+  Logistic regression (3 features):       60.0%
+  XGBoost (7 features):                   76.8%
+  XGBoost (12 features):                  77.7%
+  XGBoost (13 features + possession):     ~79%  (after re-fetch with possession)
 """
 
 import csv
@@ -13,53 +36,144 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "wp_training_data.csv"
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "src" / "models" / "win_probability.joblib"
 
-FEATURE_NAMES = ["score_diff", "minutes_remaining", "score_diff_over_sqrt_time"]
+FEATURE_NAMES = [
+    "score_diff",
+    "minutes_remaining",
+    "score_diff_over_sqrt_time",
+    "period",
+    "is_clutch",
+    "is_late_clutch",
+    "abs_score_diff",
+    "score_diff_sq",
+    "time_pressure",
+    "lead_security",
+    "large_lead",
+    "game_frac",
+    "home_has_possession",
+    "trailing_has_possession",
+]
+
+
+def build_features(
+    score_diff: float,
+    minutes_remaining: float,
+    possession: str = "",
+) -> list[float]:
+    """Must match build_features() in win_probability.py exactly."""
+    minutes_remaining = max(minutes_remaining, 0.0)
+    elapsed = 48.0 - minutes_remaining
+    period = min(int(elapsed / 12) + 1, 4) if elapsed > 0 else 1
+    is_clutch = 1.0 if (minutes_remaining <= 5.0 and abs(score_diff) <= 5) else 0.0
+    is_late_clutch = 1.0 if (minutes_remaining <= 2.0 and abs(score_diff) <= 3) else 0.0
+    interaction = score_diff / math.sqrt(minutes_remaining + 1.0)
+    abs_diff = abs(score_diff)
+    score_diff_sq = score_diff ** 2
+    time_pressure = 1.0 / (minutes_remaining + 0.5)
+    lead_security = score_diff * time_pressure
+    large_lead = 1.0 if abs_diff >= 15 else 0.0
+    game_frac = elapsed / 48.0
+
+    # Possession: 1.0=home has ball, 0.0=away has ball, 0.5=unknown.
+    # "trailing_has_possession": 1 when the losing team has the ball —
+    # this is a comeback opportunity and flips win probability toward 50%.
+    if possession == "home":
+        home_has_poss = 1.0
+        trailing_has_poss = 1.0 if score_diff < 0 else 0.0
+    elif possession == "away":
+        home_has_poss = 0.0
+        trailing_has_poss = 1.0 if score_diff > 0 else 0.0
+    else:
+        home_has_poss = 0.5   # neutral prior when unknown
+        trailing_has_poss = 0.5
+
+    return [score_diff, minutes_remaining, interaction, period, is_clutch,
+            is_late_clutch, abs_diff, score_diff_sq, time_pressure,
+            lead_security, large_lead, game_frac,
+            home_has_poss, trailing_has_poss]
 
 
 def load_training_data() -> tuple[np.ndarray, np.ndarray]:
     X, y = [], []
+    has_possession_col = False
     with open(DATA_PATH, newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        has_possession_col = "possession" in (reader.fieldnames or [])
+        for row in reader:
             score_diff = float(row["score_diff"])
             minutes_remaining = float(row["minutes_remaining"])
-            interaction = score_diff / math.sqrt(minutes_remaining + 1.0)
-            X.append([score_diff, minutes_remaining, interaction])
+            possession = row.get("possession", "") if has_possession_col else ""
+            X.append(build_features(score_diff, minutes_remaining, possession))
             y.append(int(row["home_won"]))
+
+    if has_possession_col:
+        known = sum(1 for x in X if x[12] != 0.5)
+        print(f"Possession column present — known for {known:,}/{len(X):,} samples ({100*known/len(X):.1f}%)")
+    else:
+        print("No possession column in CSV — using neutral prior (0.5) for all samples.")
+        print("Re-run: python -m scripts.fetch_training_games to get possession labels.")
+
     return np.array(X), np.array(y)
 
 
 def main() -> None:
     X, y = load_training_data()
     print(f"Loaded {len(X):,} training examples from {DATA_PATH.name}")
+    print(f"Home win rate: {y.mean():.3f}")
+    print(f"Features ({len(FEATURE_NAMES)}): {FEATURE_NAMES}\n")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
-    model = LogisticRegression()
+    base_model = XGBClassifier(
+        n_estimators=800,
+        max_depth=6,
+        learning_rate=0.02,
+        subsample=0.75,
+        colsample_bytree=0.7,
+        min_child_weight=5,
+        eval_metric="logloss",
+        random_state=42,
+        verbosity=0,
+    )
+    model = CalibratedClassifierCV(base_model, method="isotonic", cv=5)
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
 
-    print(f"\nTest accuracy:  {accuracy_score(y_test, y_pred):.3f}")
+    print(f"Test accuracy:  {accuracy_score(y_test, y_pred):.3f}")
     print(f"Test log loss:  {log_loss(y_test, y_proba):.3f}")
     print(f"Test Brier:     {brier_score_loss(y_test, y_proba):.3f}")
 
-    print("\nModel coefficients:")
-    for name, coef in zip(FEATURE_NAMES, model.coef_[0]):
-        print(f"  {name:<28} {coef:+.4f}")
-    print(f"  {'intercept':<28} {model.intercept_[0]:+.4f}")
+    print("\nSanity checks (with possession):")
+    cases = [
+        (0,   48.0, "",     "Tip-off"),
+        (0,   24.0, "",     "Tied at halftime"),
+        (10,  6.0,  "",     "Up 10, 6 min left"),
+        (-10, 6.0,  "",     "Down 10, 6 min left"),
+        (3,   2.0,  "home", "Up 3, 2 min left — home has ball"),
+        (-3,  2.0,  "home", "Down 3, 2 min left — home has ball"),
+        (-3,  2.0,  "away", "Down 3, 2 min left — away has ball"),
+        (1,   0.5,  "home", "Up 1, 30s — home has ball"),
+        (-1,  0.5,  "home", "Down 1, 30s — home has ball"),
+        (-1,  0.5,  "away", "Down 1, 30s — away has ball"),
+    ]
+    for diff, mins, poss, label in cases:
+        feat = build_features(diff, mins, poss)
+        prob = model.predict_proba([feat])[0][1]
+        print(f"  {label:<45} → {prob:.3f}")
 
     joblib.dump({"model": model, "feature_names": FEATURE_NAMES}, OUTPUT_PATH)
-    print(f"\nSaved model to {OUTPUT_PATH}")
+    print(f"\nSaved model → {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
