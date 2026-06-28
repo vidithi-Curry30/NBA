@@ -14,9 +14,53 @@ import time
 import urllib.request
 from pathlib import Path
 
-NBA_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.nba.com/"}
-SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
+NBA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 PLAYBYPLAY_URL = "https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
+
+# 2023-24 regular season + playoff game IDs spanning the full season.
+# Using a hardcoded list avoids the schedule endpoint which blocks non-browser clients.
+# IDs starting with 0022 = regular season, 0042 = playoffs.
+KNOWN_GAME_IDS = [
+    "0022300001","0022300002","0022300003","0022300004","0022300005",
+    "0022300050","0022300100","0022300150","0022300200","0022300250",
+    "0022300300","0022300350","0022300400","0022300450","0022300500",
+    "0022300550","0022300600","0022300650","0022300700","0022300750",
+    "0022300800","0022300850","0022300900","0022300950","0022301000",
+    "0022301050","0022301100","0022301150","0022301200","0022301214",
+    "0022301215","0022301216","0022301217","0022301218","0022301219",
+    "0022301220","0022301221","0022301222","0022301223","0022301224",
+    "0022300010","0022300020","0022300030","0022300040","0022300060",
+    "0022300070","0022300080","0022300090","0022300110","0022300120",
+    "0022300130","0022300140","0022300160","0022300170","0022300180",
+    "0022300190","0022300210","0022300220","0022300230","0022300240",
+    "0022300260","0022300270","0022300280","0022300290","0022300310",
+    "0022300320","0022300330","0022300340","0022300360","0022300370",
+    "0022300380","0022300390","0022300410","0022300420","0022300430",
+    "0022300440","0022300460","0022300470","0022300480","0022300490",
+    "0022300510","0022300520","0022300530","0022300540","0022300560",
+    "0022300570","0022300580","0022300590","0022300610","0022300620",
+    "0022300630","0022300640","0022300660","0022300670","0022300680",
+    "0022300690","0022300710","0022300720","0022300730","0022300740",
+    "0022300760","0022300770","0022300780","0022300790","0022300810",
+    "0022300820","0022300830","0022300840","0022300860","0022300870",
+    "0022300880","0022300890","0022300910","0022300920","0022300930",
+    "0022300940","0022300960","0022300970","0022300980","0022300990",
+    "0022301010","0022301020","0022301030","0022301040","0022301060",
+    "0022301070","0022301080","0022301090","0022301110","0022301120",
+    "0022301130","0022301140","0022301160","0022301170","0022301180",
+    "0022301190","0022301210","0022301211","0022301212","0022301213",
+    "0042300101","0042300102","0042300103","0042300104",
+    "0042300201","0042300202","0042300203","0042300204",
+    "0042300301","0042300302","0042300303","0042300304",
+    "0042300401","0042300402","0042300403","0042300404",
+    "0042300501","0042300502","0042300503","0042300504",
+]
 
 GAME_MINUTES = 48.0
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "data" / "wp_training_data.csv"
@@ -28,19 +72,11 @@ def _fetch_json(url: str) -> dict:
         return json.loads(resp.read())
 
 
-def _final_game_ids(max_games: int) -> list[str]:
-    schedule = _fetch_json(SCHEDULE_URL)
-    game_ids = []
-    for game_date in schedule["leagueSchedule"]["gameDates"]:
-        for game in game_date["games"]:
-            if game["gameStatus"] == 3 and game["gameId"].startswith("002"):
-                game_ids.append(game["gameId"])
-
-    if len(game_ids) <= max_games:
-        return game_ids
-
-    step = len(game_ids) / max_games
-    return [game_ids[int(i * step)] for i in range(max_games)]
+def _select_game_ids(max_games: int) -> list[str]:
+    if len(KNOWN_GAME_IDS) <= max_games:
+        return list(KNOWN_GAME_IDS)
+    step = len(KNOWN_GAME_IDS) / max_games
+    return [KNOWN_GAME_IDS[int(i * step)] for i in range(max_games)]
 
 
 def _clock_to_minutes_remaining(period: int, clock: str) -> float:
@@ -154,9 +190,8 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=150)
     args = parser.parse_args()
 
-    print("Fetching schedule...")
-    game_ids = _final_game_ids(args.games)
-    print(f"Selected {len(game_ids)} completed games.")
+    game_ids = _select_game_ids(args.games)
+    print(f"Selected {len(game_ids)} games from hardcoded 2023-24 season list.")
 
     rows = []
     for i, game_id in enumerate(game_ids, 1):
