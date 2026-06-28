@@ -183,7 +183,11 @@ def run(game_id: str) -> None:
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) < 2:
-        print("Usage: python -m src.processor <game_id>")
+    # Accept game_id from CLI arg or GAME_ID env var (used on Fly.io).
+    if len(sys.argv) >= 2:
+        run(sys.argv[1])
+    elif os.getenv("GAME_ID"):
+        run(os.getenv("GAME_ID"))
+    else:
+        print("Usage: python -m src.processor <game_id>  (or set GAME_ID env var)")
         sys.exit(1)
-    run(sys.argv[1])

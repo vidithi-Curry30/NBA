@@ -13,8 +13,10 @@ from contextlib import asynccontextmanager
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from src.dashboard import DASHBOARD_HTML
 from src.metrics import (
     LEAGUE_AVERAGE_OFFENSIVE_RATING,
     LEAGUE_AVERAGE_PACE,
@@ -141,6 +143,12 @@ class EventsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/dashboard/{game_id}", response_class=HTMLResponse, include_in_schema=False)
+async def get_dashboard(game_id: str) -> HTMLResponse:
+    """Live visual dashboard for a game."""
+    return HTMLResponse(DASHBOARD_HTML.format(game_id=game_id))
+
 
 @app.get("/game/{game_id}/state", response_model=GameState)
 async def get_game_state(game_id: str) -> GameState:
