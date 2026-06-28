@@ -2,7 +2,7 @@
 Win probability inference: load the trained XGBoost model and score a GameState.
 
 Feature construction must stay in sync with scripts/train_win_probability.py.
-12 features, up from the original 3 (logistic regression baseline).
+14 features including possession (home/away/unknown).
 """
 
 import math
@@ -18,7 +18,11 @@ _feature_names = _artifact["feature_names"]
 GAME_MINUTES = 48.0
 
 
-def build_features(score_diff: int, minutes_remaining: float) -> list[float]:
+def build_features(
+    score_diff: int,
+    minutes_remaining: float,
+    possession: str = "",
+) -> list[float]:
     """Must match build_features() in train_win_probability.py exactly."""
     minutes_remaining = max(minutes_remaining, 0.0)
     elapsed = GAME_MINUTES - minutes_remaining
@@ -32,9 +36,21 @@ def build_features(score_diff: int, minutes_remaining: float) -> list[float]:
     lead_security = score_diff * time_pressure
     large_lead = 1.0 if abs_diff >= 15 else 0.0
     game_frac = elapsed / GAME_MINUTES
+
+    if possession == "home":
+        home_has_poss = 1.0
+        trailing_has_poss = 1.0 if score_diff < 0 else 0.0
+    elif possession == "away":
+        home_has_poss = 0.0
+        trailing_has_poss = 1.0 if score_diff > 0 else 0.0
+    else:
+        home_has_poss = 0.5
+        trailing_has_poss = 0.5
+
     return [score_diff, minutes_remaining, interaction, period, is_clutch,
             is_late_clutch, abs_diff, score_diff_sq, time_pressure,
-            lead_security, large_lead, game_frac]
+            lead_security, large_lead, game_frac,
+            home_has_poss, trailing_has_poss]
 
 
 def predict_win_probability(state: "GameState") -> float:
@@ -48,5 +64,5 @@ def predict_win_probability(state: "GameState") -> float:
 
     score_diff = state.home_score - state.away_score
     minutes_remaining = GAME_MINUTES - state.minutes_elapsed
-    features = build_features(score_diff, minutes_remaining)
+    features = build_features(score_diff, minutes_remaining, state.current_possession)
     return float(_model.predict_proba([features])[0][1])

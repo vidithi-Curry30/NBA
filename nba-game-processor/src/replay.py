@@ -71,6 +71,8 @@ def _normalize_cdn_event(game_id: str, play: dict, home_team: str, away_team: st
         event_type = "score" if play.get("shotResult", "").lower() == "made" else "missed shot"
     elif action_type == "substitution":
         event_type = "substitution"
+    elif action_type == "rebound":
+        event_type = "rebound"
     elif action_type == "period":
         event_type = "period start"
     elif action_type == "turnover":
@@ -82,7 +84,7 @@ def _normalize_cdn_event(game_id: str, play: dict, home_team: str, away_team: st
     else:
         event_type = action_type
 
-    sub_type = str(play.get("subType", "")).lower() if action_type == "substitution" else ""
+    sub_type = str(play.get("subType", "")).lower() if action_type in ("substitution", "rebound") else ""
     raw_clock = str(play.get("clock", "PT12M00S")).replace("PT", "").replace("M", ":").rstrip("S")
 
     return {
