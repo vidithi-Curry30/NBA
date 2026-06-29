@@ -87,7 +87,7 @@ class GameState(BaseModel):
 
     def _update_pace(self) -> None:
         """Pace = possessions per team per 48 minutes (Basketball Reference formula)."""
-        if self.minutes_elapsed > 0:
+        if self.minutes_elapsed >= 2.0:  # need at least 2 min for a meaningful estimate
             avg_team_possessions = (self.home_possessions + self.away_possessions) / 2.0
             self.pace = (avg_team_possessions / self.minutes_elapsed) * 48.0
 
@@ -232,9 +232,15 @@ class GameState(BaseModel):
             period_int = int(raw_period)
         except (ValueError, TypeError):
             period_int = self.period
-        self.period = period_int
-        self.clock = str(raw_clock)
-        self.minutes_elapsed = self._parse_clock(self.clock, self.period)
+
+        # Only advance time — never let out-of-order or supplemental events
+        # (e.g. a "period start Q1" appended after play events) move the
+        # clock backwards. Game time is monotonically non-decreasing.
+        new_elapsed = self._parse_clock(str(raw_clock), period_int)
+        if new_elapsed >= self.minutes_elapsed:
+            self.period = period_int
+            self.clock = str(raw_clock)
+            self.minutes_elapsed = new_elapsed
 
         if event.get("home_team") and not self.home_team:
             self.home_team = str(event["home_team"])
