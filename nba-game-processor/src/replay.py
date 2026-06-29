@@ -57,9 +57,25 @@ def _fetch_play_by_play(game_id: str) -> tuple[list[dict], str, str]:
     resp.raise_for_status()
     data = resp.json()
     game = data["game"]
-    home_team = game.get("homeTeam", {}).get("teamTricode", "")
-    away_team = game.get("awayTeam", {}).get("teamTricode", "")
+
+    # CDN uses teamTricode in live games; completed games sometimes use triCode
+    def _tricode(team_dict: dict) -> str:
+        return (team_dict.get("teamTricode")
+                or team_dict.get("triCode")
+                or team_dict.get("teamAbbreviation", ""))
+
+    home_team = _tricode(game.get("homeTeam") or game.get("hTeam") or {})
+    away_team = _tricode(game.get("awayTeam") or game.get("vTeam") or {})
+
     actions = game.get("actions", [])
+
+    # Last resort: infer from the first play that has a teamTricode
+    if (not home_team or not away_team) and actions:
+        tricodes = [a.get("teamTricode", "") for a in actions if a.get("teamTricode")]
+        unique = list(dict.fromkeys(t for t in tricodes if t))
+        if len(unique) >= 2 and not home_team:
+            home_team, away_team = unique[0], unique[1]
+
     return actions, home_team, away_team
 
 
