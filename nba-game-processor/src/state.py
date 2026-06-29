@@ -170,17 +170,29 @@ class GameState(BaseModel):
         if not team:
             return
 
-        # Offensive rebound: same team that missed keeps the ball.
-        # Defensive rebound: possession switches to the rebounding team.
-        # We determine which it is from sub_type when available, otherwise
-        # fall back to comparing rebounding team vs last shooting team.
+        rebounding_side = "home" if team == self.home_team else "away"
+
+        # Determine offensive vs defensive so we can count possessions correctly.
+        # An offensive rebound extends the current possession (no new possession).
+        # A defensive rebound ends the shooting team's possession and starts a new one.
         if sub_type == "offensive":
-            self.current_possession = "home" if team == self.home_team else "away"
+            is_offensive = True
         elif sub_type == "defensive":
-            self.current_possession = "home" if team == self.home_team else "away"
+            is_offensive = False
         else:
-            # No sub_type: infer from whether rebounding team == last shooter.
-            self.current_possession = "home" if team == self.home_team else "away"
+            # No sub_type: infer from last_shooting_team. Same team rebounding
+            # their own miss = offensive; different team = defensive.
+            is_offensive = (team == self.last_shooting_team)
+
+        if is_offensive:
+            # Same possession continues — just confirm possession stays with rebounder.
+            self.current_possession = rebounding_side
+        else:
+            # Defensive rebound: the shooting team's possession just ended.
+            shooting_side = "home" if self.last_shooting_team == self.home_team else "away"
+            if self.last_shooting_team:
+                self._record_possession(shooting_side, "missed_shot")
+            self.current_possession = rebounding_side
 
     def _handle_foul(self, event: dict) -> None:
         player = str(event.get("player", "")).strip()

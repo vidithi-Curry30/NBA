@@ -4,11 +4,26 @@ Redis Stream consumer: reads events, updates GameState, writes a snapshot.
 This is the hot path of the pipeline. It reads events one at a time from the
 Redis Stream, applies them to a GameState, and writes the result to a Redis
 Hash that the API reads in O(1).
+
+Scaling model
+-------------
+One processor process per game — games are independent and share nothing
+(separate stream keys, consumer groups, and state hashes). This is the right
+unit of parallelism: the bottleneck is I/O with Redis, not CPU, and a single
+asyncio process handles that easily at NBA play-by-play rates (~1 event/3s).
+
+Each processor identifies itself with a unique CONSUMER_NAME within the
+shared consumer group. Two processors with the same name targeting the same
+game would each only receive a subset of messages and produce divergent state,
+so uniqueness per game matters. The default is "processor-<hostname>"; on a
+container platform (Fly.io, k8s) the hostname is unique per replica, so the
+default is safe. Pass --consumer-name or CONSUMER_NAME to override.
 """
 
 import asyncio
 import logging
 import os
+import socket
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
@@ -25,7 +40,9 @@ STREAM_KEY_TEMPLATE = "game_events:{game_id}"
 STATE_KEY_TEMPLATE = "game_state:{game_id}"
 
 CONSUMER_GROUP = "processors"
-CONSUMER_NAME = "processor-1"
+# Default to hostname so each container/machine gets a unique name without
+# coordination.  Override via --consumer-name CLI arg or CONSUMER_NAME env var.
+_DEFAULT_CONSUMER_NAME = f"processor-{socket.gethostname()}"
 
 # Keep state queryable for a few hours after a game ends without letting
 # Redis grow unboundedly across all games.
@@ -80,7 +97,10 @@ async def _load_state_snapshot(
 
 
 async def _drain_pending_messages(
-    redis_client: aioredis.Redis, stream_key: str, state: GameState
+    redis_client: aioredis.Redis,
+    stream_key: str,
+    state: GameState,
+    consumer_name: str,
 ) -> GameState:
     """
     Reprocess any messages left in this consumer's pending entries list (PEL).
@@ -95,7 +115,7 @@ async def _drain_pending_messages(
     while True:
         results = await redis_client.xreadgroup(
             groupname=CONSUMER_GROUP,
-            consumername=CONSUMER_NAME,
+            consumername=consumer_name,
             streams={stream_key: "0"},
             count=10,
         )
@@ -105,7 +125,7 @@ async def _drain_pending_messages(
 
         for message_id, fields in messages:
             state = await _process_message(
-                redis_client, stream_key, message_id, fields, state
+                redis_client, stream_key, message_id, fields, state, consumer_name
             )
 
         if state.game_status == "final":
@@ -118,6 +138,7 @@ async def _process_message(
     message_id: str,
     fields: dict,
     state: GameState,
+    consumer_name: str,
 ) -> GameState:
     """Apply one stream message to the game state and acknowledge it."""
     if PROCESSOR_DEMO_DELAY_MS:
@@ -131,11 +152,11 @@ async def _process_message(
     # Acking before the write would risk a stale snapshot with no way to
     # recover the missed event.
     await redis_client.xack(stream_key, CONSUMER_GROUP, message_id)
-    logger.debug("Processed and acked message %s", message_id)
+    logger.debug("Processed and acked message %s (consumer=%s)", message_id, consumer_name)
     return state
 
 
-async def process_game(game_id: str) -> None:
+async def process_game(game_id: str, consumer_name: str = _DEFAULT_CONSUMER_NAME) -> None:
     """Main consumer loop: read events from the stream and maintain game state."""
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     stream_key = STREAM_KEY_TEMPLATE.format(game_id=game_id)
@@ -147,15 +168,15 @@ async def process_game(game_id: str) -> None:
     state = await _load_state_snapshot(redis_client, game_id)
     if state is None:
         state = GameState(game_id=game_id)
-    logger.info("Processor started for game %s", game_id)
+    logger.info("Processor started for game %s (consumer=%s)", game_id, consumer_name)
 
-    state = await _drain_pending_messages(redis_client, stream_key, state)
+    state = await _drain_pending_messages(redis_client, stream_key, state, consumer_name)
 
     try:
         while state.game_status != "final":
             results = await redis_client.xreadgroup(
                 groupname=CONSUMER_GROUP,
-                consumername=CONSUMER_NAME,
+                consumername=consumer_name,
                 streams={stream_key: ">"},
                 count=10,
                 block=XREADGROUP_BLOCK_MS,
@@ -167,7 +188,7 @@ async def process_game(game_id: str) -> None:
             for _stream, messages in results:
                 for message_id, fields in messages:
                     state = await _process_message(
-                        redis_client, stream_key, message_id, fields, state
+                        redis_client, stream_key, message_id, fields, state, consumer_name
                     )
 
             if state.game_status == "final":
@@ -177,17 +198,32 @@ async def process_game(game_id: str) -> None:
         await redis_client.aclose()
 
 
-def run(game_id: str) -> None:
-    asyncio.run(process_game(game_id))
+def run(game_id: str, consumer_name: str = _DEFAULT_CONSUMER_NAME) -> None:
+    asyncio.run(process_game(game_id, consumer_name))
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
-    # Accept game_id from CLI arg or GAME_ID env var (used on Fly.io).
-    if len(sys.argv) >= 2:
-        run(sys.argv[1])
-    elif os.getenv("GAME_ID"):
-        run(os.getenv("GAME_ID"))
-    else:
-        print("Usage: python -m src.processor <game_id>  (or set GAME_ID env var)")
+
+    parser = argparse.ArgumentParser(description="NBA game stream processor")
+    parser.add_argument("game_id", nargs="?", help="NBA game ID to process")
+    parser.add_argument(
+        "--consumer-name",
+        default=os.getenv("CONSUMER_NAME", _DEFAULT_CONSUMER_NAME),
+        help=(
+            "Unique consumer name within the Redis consumer group. "
+            "Defaults to 'processor-<hostname>'. Must be unique per game — "
+            "two processors with the same name on the same game would each "
+            "receive only a subset of messages and produce divergent state."
+        ),
+    )
+    args = parser.parse_args()
+
+    game_id = args.game_id or os.getenv("GAME_ID")
+    if not game_id:
+        parser.print_usage()
+        print("error: game_id required (positional arg or GAME_ID env var)")
         sys.exit(1)
+
+    run(game_id, args.consumer_name)

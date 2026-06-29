@@ -207,14 +207,16 @@ def test_pace_zero_at_game_start():
 
 
 def test_pace_updates_after_event():
-    """Pace is recalculated and non-zero after a scoring event."""
+    """Pace is non-zero once at least 2 minutes have elapsed."""
     state = make_base_state()
+    # clock "9:00" in Q1 = 3 minutes elapsed, clearing the 2-min minimum
+    # required before _update_pace attempts an estimate.
     state.update({
         "event_type": "score",
         "home_score": "2",
         "away_score": "0",
         "period": "1",
-        "clock": "11:00",
+        "clock": "9:00",
     })
     assert state.pace > 0
 
@@ -374,3 +376,96 @@ def test_foul_event_ignored_without_player():
     state = make_base_state()
     state.update({"event_type": "foul", "player": "", "period": "1", "clock": "10:00"})
     assert state.player_fouls == {}
+
+
+# ---------------------------------------------------------------------------
+# Rebound possession tests
+# ---------------------------------------------------------------------------
+
+def test_defensive_rebound_records_possession_for_shooting_team():
+    """
+    A defensive rebound ends the shooting team's possession.
+    Home misses → away gets defensive rebound → home_possessions increments
+    (the missed shot was home's possession), possession switches to away.
+    """
+    state = make_base_state()
+    state.last_shooting_team = "BOS"
+    state.update({
+        "event_type": "rebound",
+        "team": "DAL",
+        "sub_type": "defensive",
+        "period": "1",
+        "clock": "10:00",
+    })
+    assert state.home_possessions == 1      # BOS's possession was counted
+    assert state.away_possessions == 0
+    assert state.current_possession == "away"
+    assert state.last_10_possessions[-1] == "missed_shot"
+
+
+def test_offensive_rebound_does_not_count_new_possession():
+    """
+    An offensive rebound extends the current possession — no new possession counted.
+    Home misses → home gets offensive rebound → possession stays home, no count.
+    """
+    state = make_base_state()
+    state.last_shooting_team = "BOS"
+    state.update({
+        "event_type": "rebound",
+        "team": "BOS",
+        "sub_type": "offensive",
+        "period": "1",
+        "clock": "10:00",
+    })
+    assert state.home_possessions == 0      # same possession, not a new one
+    assert state.current_possession == "home"
+
+
+def test_rebound_no_subtype_infers_defensive_from_last_shooting_team():
+    """
+    Without sub_type, a rebound by the team that did NOT shoot last is defensive.
+    """
+    state = make_base_state()
+    state.last_shooting_team = "BOS"
+    state.update({
+        "event_type": "rebound",
+        "team": "DAL",          # DAL did not shoot last → defensive rebound
+        "period": "1",
+        "clock": "10:00",
+    })
+    assert state.home_possessions == 1      # BOS's possession counted
+    assert state.current_possession == "away"
+
+
+def test_rebound_no_subtype_infers_offensive_from_last_shooting_team():
+    """
+    Without sub_type, a rebound by the same team that shot last is offensive.
+    """
+    state = make_base_state()
+    state.last_shooting_team = "BOS"
+    state.update({
+        "event_type": "rebound",
+        "team": "BOS",          # BOS shot last → offensive rebound
+        "period": "1",
+        "clock": "10:00",
+    })
+    assert state.home_possessions == 0      # no new possession
+    assert state.current_possession == "home"
+
+
+def test_defensive_rebound_without_last_shooting_team_does_not_crash():
+    """
+    Defensive rebound at game start (no last_shooting_team) is a no-op for
+    possession counting but still sets current_possession correctly.
+    """
+    state = make_base_state()
+    # last_shooting_team is "" — no previous shooter known
+    state.update({
+        "event_type": "rebound",
+        "team": "DAL",
+        "sub_type": "defensive",
+        "period": "1",
+        "clock": "11:30",
+    })
+    assert state.home_possessions == 0      # no shooting team to credit
+    assert state.current_possession == "away"

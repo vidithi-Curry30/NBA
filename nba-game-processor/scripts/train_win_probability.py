@@ -31,7 +31,6 @@ Accuracy progression:
 """
 
 import csv
-import math
 from pathlib import Path
 
 import joblib
@@ -41,63 +40,10 @@ from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
+from src.features import FEATURE_NAMES, build_features  # single source of truth
+
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "wp_training_data.csv"
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "src" / "models" / "win_probability.joblib"
-
-FEATURE_NAMES = [
-    "score_diff",
-    "minutes_remaining",
-    "score_diff_over_sqrt_time",
-    "period",
-    "is_clutch",
-    "is_late_clutch",
-    "abs_score_diff",
-    "score_diff_sq",
-    "time_pressure",
-    "lead_security",
-    "large_lead",
-    "game_frac",
-    "home_has_possession",
-    "trailing_has_possession",
-]
-
-
-def build_features(
-    score_diff: float,
-    minutes_remaining: float,
-    possession: str = "",
-) -> list[float]:
-    """Must match build_features() in win_probability.py exactly."""
-    minutes_remaining = max(minutes_remaining, 0.0)
-    elapsed = 48.0 - minutes_remaining
-    period = min(int(elapsed / 12) + 1, 4) if elapsed > 0 else 1
-    is_clutch = 1.0 if (minutes_remaining <= 5.0 and abs(score_diff) <= 5) else 0.0
-    is_late_clutch = 1.0 if (minutes_remaining <= 2.0 and abs(score_diff) <= 3) else 0.0
-    interaction = score_diff / math.sqrt(minutes_remaining + 1.0)
-    abs_diff = abs(score_diff)
-    score_diff_sq = score_diff ** 2
-    time_pressure = 1.0 / (minutes_remaining + 0.5)
-    lead_security = score_diff * time_pressure
-    large_lead = 1.0 if abs_diff >= 15 else 0.0
-    game_frac = elapsed / 48.0
-
-    # Possession: 1.0=home has ball, 0.0=away has ball, 0.5=unknown.
-    # "trailing_has_possession": 1 when the losing team has the ball —
-    # this is a comeback opportunity and flips win probability toward 50%.
-    if possession == "home":
-        home_has_poss = 1.0
-        trailing_has_poss = 1.0 if score_diff < 0 else 0.0
-    elif possession == "away":
-        home_has_poss = 0.0
-        trailing_has_poss = 1.0 if score_diff > 0 else 0.0
-    else:
-        home_has_poss = 0.5   # neutral prior when unknown
-        trailing_has_poss = 0.5
-
-    return [score_diff, minutes_remaining, interaction, period, is_clutch,
-            is_late_clutch, abs_diff, score_diff_sq, time_pressure,
-            lead_security, large_lead, game_frac,
-            home_has_poss, trailing_has_poss]
 
 
 def load_training_data() -> tuple[np.ndarray, np.ndarray]:
