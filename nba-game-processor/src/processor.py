@@ -168,7 +168,15 @@ async def process_game(game_id: str) -> None:
         state = GameState(game_id=game_id)
     logger.info("Processor started for game %s", game_id)
 
-    state = await _drain_pending_messages(redis_client, stream_key, state)
+    try:
+        state = await _drain_pending_messages(redis_client, stream_key, state)
+    except aioredis.ResponseError as exc:
+        if "NOGROUP" in str(exc):
+            # Stream was deleted and recreated — consumer group is gone.
+            # Re-create it and continue; there are no pending messages to drain.
+            await _ensure_consumer_group(redis_client, stream_key)
+        else:
+            raise
 
     try:
         while state.game_status != "final":
