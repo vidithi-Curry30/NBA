@@ -170,17 +170,40 @@ class GameState(BaseModel):
         if not team:
             return
 
-        # Offensive rebound: same team that missed keeps the ball.
-        # Defensive rebound: possession switches to the rebounding team.
-        # We determine which it is from sub_type when available, otherwise
-        # fall back to comparing rebounding team vs last shooting team.
-        if sub_type == "offensive":
-            self.current_possession = "home" if team == self.home_team else "away"
-        elif sub_type == "defensive":
-            self.current_possession = "home" if team == self.home_team else "away"
-        else:
+        is_home = team == self.home_team
+        if not sub_type:
             # No sub_type: infer from whether rebounding team == last shooter.
-            self.current_possession = "home" if team == self.home_team else "away"
+            sub_type = "offensive" if team == self.last_shooting_team else "defensive"
+
+        if sub_type == "offensive":
+            # Same team that missed keeps the ball — possession continues.
+            self.current_possession = "home" if is_home else "away"
+        else:
+            # Defensive rebound ends the missing team's possession; count it
+            # for the team that was shooting (their possession just ended).
+            shooting_team = "away" if is_home else "home"
+            self._record_possession(shooting_team, "missed_shot")
+            self.current_possession = "home" if is_home else "away"
+
+    def _track_on_court(self, team: str, player: str) -> None:
+        """
+        Add a player to their team's on-court list if not already tracked.
+
+        Substitution events alone never establish the starting five — they
+        only fire on a change. Any other event naming a player (a shot, a
+        rebound, a foul, ...) is proof that player is on the floor, so we
+        opportunistically fill the roster up to 5 from those events too.
+        """
+        if not team or not player:
+            return
+        if team == self.home_team:
+            roster = self.home_players_on_court
+        elif team == self.away_team:
+            roster = self.away_players_on_court
+        else:
+            return
+        if player not in roster and len(roster) < 5:
+            roster.append(player)
 
     def _handle_foul(self, event: dict) -> None:
         player = str(event.get("player", "")).strip()
@@ -246,6 +269,9 @@ class GameState(BaseModel):
             self.home_team = str(event["home_team"])
         if event.get("away_team") and not self.away_team:
             self.away_team = str(event["away_team"])
+
+        if event_type != "substitution":
+            self._track_on_court(str(event.get("team", "")), str(event.get("player", "")))
 
         if event_type in ("score", "made shot", "free throw", "score change"):
             self._handle_score_change(event)

@@ -559,6 +559,10 @@ function render(state, momentum, wp, foul, events, latency) {{
   // Chart update
   const canvas = document.getElementById("wp-canvas");
   if (canvas) {{
+    if (wpChart && wpChart.canvas !== canvas) {{
+      wpChart.destroy();
+      wpChart = null;
+    }}
     if (!wpChart) wpChart = buildChart(canvas.getContext("2d"));
     wpChart.data.labels = wpHistory.map(d => d.l);
     wpChart.data.datasets[0].data = wpHistory.map(d => +(d.v * 100).toFixed(1));
