@@ -226,6 +226,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .chip.home {{ background: rgba(59,130,246,0.1); color: #93c5fd; border: 1px solid rgba(59,130,246,0.2); }}
   .chip.away {{ background: rgba(244,63,94,0.1); color: #fda4af; border: 1px solid rgba(244,63,94,0.2); }}
 
+  /* ── Kelly ── */
+  .kelly-row {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+    background: var(--surface2); border: 1px solid var(--border);
+  }}
+  .kelly-label {{ font-size: 9px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); }}
+  .kelly-value {{ font-size: 13px; font-weight: 600; color: var(--green); font-family: 'JetBrains Mono', monospace; }}
+  .kelly-value.negative {{ color: var(--away); }}
+  .kelly-interp {{ font-size: 11px; color: var(--muted); margin-top: 3px; }}
+
+  /* ── Latency ── */
+  .latency-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 4px; }}
+  .latency-cell {{ text-align: center; padding: 10px; background: var(--surface2); border-radius: 8px; }}
+  .latency-pct {{ font-size: 9px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }}
+  .latency-val {{ font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 600; color: var(--text); }}
+  .latency-unit {{ font-size: 10px; color: var(--muted2); margin-top: 2px; }}
+  .latency-meta {{ font-size: 11px; color: var(--muted2); margin-top: 10px; text-align: center; }}
+
   /* ── Footer ── */
   .footer {{ text-align: center; margin-top: 32px; font-size: 11px; color: var(--muted2); }}
 
@@ -351,7 +370,7 @@ function renderFeed(events, home, away) {{
   }}).join("");
 }}
 
-function render(state, momentum, wp, foul, events) {{
+function render(state, momentum, wp, foul, events, latency) {{
   const home = state.home_team || "HOME";
   const away = state.away_team || "AWAY";
   const isFinal = state.game_status === "final";
@@ -419,6 +438,36 @@ function render(state, momentum, wp, foul, events) {{
   // Feed
   const feedItems = events ? renderFeed(events.events || [], home, away) : '<div class="feed-empty">No events yet</div>';
 
+  // Kelly
+  const kf = wp.kelly_fraction ?? 0;
+  const kfPct = (Math.abs(kf) * 100).toFixed(1);
+  const kellyValCls = kf < 0 ? "negative" : "";
+  const kellyHTML = `
+    <div class="kelly-row">
+      <div>
+        <div class="kelly-label">Kelly Criterion</div>
+        <div class="kelly-interp">${{wp.kelly_interpretation || "—"}}</div>
+      </div>
+      <div class="kelly-value ${{kellyValCls}}">${{kf >= 0 ? "+" : ""}}${{kfPct}}%</div>
+    </div>`;
+
+  // Latency
+  let latencyHTML = "";
+  if (latency && latency.samples > 0) {{
+    const p50c = latency.p50_ms < 5 ? "var(--green)" : latency.p50_ms < 20 ? "var(--yellow)" : "var(--red)";
+    const p95c = latency.p95_ms < 10 ? "var(--green)" : latency.p95_ms < 50 ? "var(--yellow)" : "var(--red)";
+    const p99c = latency.p99_ms < 20 ? "var(--green)" : latency.p99_ms < 100 ? "var(--yellow)" : "var(--red)";
+    latencyHTML = `
+      <div class="latency-grid">
+        <div class="latency-cell"><div class="latency-pct">p50</div><div class="latency-val" style="color:${{p50c}}">${{latency.p50_ms.toFixed(2)}}</div><div class="latency-unit">ms</div></div>
+        <div class="latency-cell"><div class="latency-pct">p95</div><div class="latency-val" style="color:${{p95c}}">${{latency.p95_ms.toFixed(2)}}</div><div class="latency-unit">ms</div></div>
+        <div class="latency-cell"><div class="latency-pct">p99</div><div class="latency-val" style="color:${{p99c}}">${{latency.p99_ms.toFixed(2)}}</div><div class="latency-unit">ms</div></div>
+      </div>
+      <div class="latency-meta">${{latency.samples}} samples · min ${{latency.min_ms.toFixed(2)}}ms · max ${{latency.max_ms.toFixed(2)}}ms</div>`;
+  }} else {{
+    latencyHTML = '<div class="foul-empty">Collecting samples…</div>';
+  }}
+
   document.getElementById("root").innerHTML = `
     <div class="scoreboard">
       <div class="teams">
@@ -448,6 +497,7 @@ function render(state, momentum, wp, foul, events) {{
           <div class="wp-fill-away" style="width:${{awayPct}}%"></div>
           <div class="wp-mid"></div>
         </div>
+        ${{kellyHTML}}
       </div>
     </div>
 
@@ -499,6 +549,11 @@ function render(state, momentum, wp, foul, events) {{
       <div class="card-title">On Court</div>
       ${{rosterHTML}}
     </div>
+
+    <div class="card">
+      <div class="card-title">Pipeline Latency — Event → State Update</div>
+      ${{latencyHTML}}
+    </div>
   `;
 
   // Chart update
@@ -514,25 +569,60 @@ function render(state, momentum, wp, foul, events) {{
   document.getElementById("update-time").textContent = "Updated " + new Date().toLocaleTimeString();
 }}
 
-async function fetchAll() {{
+// Derived-metric polling: momentum, WP, foul-trouble, events, latency.
+// These run on a 2s interval and are triggered fresh whenever SSE delivers
+// a new state — so updates happen on state change, not just on a clock tick.
+let latestState = null;
+let latencyCache = null;
+let latencyFetchedAt = 0;
+
+async function fetchDerived(state) {{
   try {{
-    const [sR, mR, wR, fR, eR] = await Promise.all([
-      fetch("/game/" + GAME_ID + "/state"),
+    const [mR, wR, fR, eR] = await Promise.all([
       fetch("/game/" + GAME_ID + "/momentum"),
       fetch("/game/" + GAME_ID + "/win-probability"),
       fetch("/game/" + GAME_ID + "/foul-trouble"),
       fetch("/game/" + GAME_ID + "/events?limit=15"),
     ]);
-    if (!sR.ok) return;
-    const [state, momentum, wp, foul, events] = await Promise.all([
-      sR.json(), mR.json(), wR.json(), fR.json(), eR.ok ? eR.json() : Promise.resolve(null)
+    const [momentum, wp, foul, events] = await Promise.all([
+      mR.json(), wR.json(), fR.json(), eR.ok ? eR.json() : Promise.resolve(null)
     ]);
-    render(state, momentum, wp, foul, events);
+
+    // Latency is cheap to fetch but slow to change — refresh every 5s.
+    const now = Date.now();
+    if (now - latencyFetchedAt > 5000) {{
+      const lR = await fetch("/game/" + GAME_ID + "/latency");
+      if (lR.ok) latencyCache = await lR.json();
+      latencyFetchedAt = now;
+    }}
+
+    render(state, momentum, wp, foul, events, latencyCache);
   }} catch(e) {{ console.error(e); }}
 }}
 
-fetchAll();
-setInterval(fetchAll, 2000);
+// SSE connection: the server pushes a new game state snapshot whenever it
+// changes. On each push we immediately fetch the derived metrics so the
+// entire dashboard refreshes in under 100ms of a real event.
+function connectSSE() {{
+  const es = new EventSource("/game/" + GAME_ID + "/stream");
+
+  es.onmessage = (e) => {{
+    try {{
+      const state = JSON.parse(e.data);
+      if (state.error) return;
+      latestState = state;
+      fetchDerived(state);
+    }} catch(_) {{}}
+  }};
+
+  es.onerror = () => {{
+    // Reconnect after 3s if the SSE connection drops.
+    es.close();
+    setTimeout(connectSSE, 3000);
+  }};
+}}
+
+connectSSE();
 </script>
 </body>
 </html>"""

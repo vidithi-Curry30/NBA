@@ -9,6 +9,7 @@ Hash that the API reads in O(1).
 import asyncio
 import logging
 import os
+import time
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
@@ -33,6 +34,11 @@ STATE_TTL_SECONDS = 4 * 60 * 60
 
 # Wake at most once per second when idle.
 XREADGROUP_BLOCK_MS = 1000
+
+# Redis key for latency samples (sorted set, score = timestamp, value = latency_ms).
+LATENCY_KEY_TEMPLATE = "game_latency:{game_id}"
+# Keep last 1000 samples — enough for stable p99 without unbounded growth.
+LATENCY_MAX_SAMPLES = 1000
 
 # Optional artificial delay per message, used by demo_crash_recovery.py to
 # slow processing enough to reliably kill -9 mid-stream. Off by default.
@@ -112,6 +118,20 @@ async def _drain_pending_messages(
             return state
 
 
+async def _record_latency(
+    redis_client: aioredis.Redis, game_id: str, latency_ms: float
+) -> None:
+    """Append a latency sample and trim to the last LATENCY_MAX_SAMPLES entries."""
+    key = LATENCY_KEY_TEMPLATE.format(game_id=game_id)
+    now = time.time()
+    async with redis_client.pipeline(transaction=False) as pipe:
+        # score = wall-clock timestamp so we can trim by recency
+        pipe.zadd(key, {f"{now}:{latency_ms:.3f}": now})
+        pipe.zremrangebyrank(key, 0, -(LATENCY_MAX_SAMPLES + 1))
+        pipe.expire(key, STATE_TTL_SECONDS)
+        await pipe.execute()
+
+
 async def _process_message(
     redis_client: aioredis.Redis,
     stream_key: str,
@@ -123,15 +143,14 @@ async def _process_message(
     if PROCESSOR_DEMO_DELAY_MS:
         await asyncio.sleep(PROCESSOR_DEMO_DELAY_MS / 1000.0)
 
+    t0 = time.monotonic()
     state.update(fields)
     await _write_state_snapshot(redis_client, state)
+    latency_ms = (time.monotonic() - t0) * 1000.0
 
-    # Ack after the snapshot write: this is at-least-once delivery, so a
-    # crash before the ack just means the message is reprocessed on restart.
-    # Acking before the write would risk a stale snapshot with no way to
-    # recover the missed event.
     await redis_client.xack(stream_key, CONSUMER_GROUP, message_id)
-    logger.debug("Processed and acked message %s", message_id)
+    await _record_latency(redis_client, state.game_id, latency_ms)
+    logger.debug("Processed and acked message %s (%.2f ms)", message_id, latency_ms)
     return state
 
 

@@ -65,4 +65,22 @@ def predict_win_probability(state: "GameState") -> float:
     score_diff = state.home_score - state.away_score
     minutes_remaining = GAME_MINUTES - state.minutes_elapsed
     features = build_features(score_diff, minutes_remaining, state.current_possession)
-    return float(_model.predict_proba([features])[0][1])
+    raw = float(_model.predict_proba([features])[0][1])
+    # Clamp to [0.03, 0.97] — the model was trained on simulated games that
+    # never produce true certainty mid-game, so extreme outputs are noise.
+    return max(0.03, min(0.97, raw))
+
+
+def kelly_fraction(p_win: float, odds: float = 1.0) -> float:
+    """
+    Kelly criterion: optimal fraction of bankroll to wager on home team.
+
+    f* = (b*p - q) / b   where b = decimal odds (net), p = P(win), q = 1-p.
+
+    Default odds=1.0 models an even-money bet (e.g. a spread bet at -110
+    approximated as fair). Negative fraction means bet the away team instead;
+    zero means no edge.
+    """
+    q = 1.0 - p_win
+    f = (odds * p_win - q) / odds
+    return round(f, 4)
